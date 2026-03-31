@@ -94,6 +94,29 @@ def run_export_scripts():
         print("❌ FlowLM Export Failed")
         sys.exit(1)
 
+def run_optimization():
+    print(f"\n--- Running XNNPACK Optimization ---")
+    
+    if not any(OUTPUT_DIR.glob("*.onnx")):
+        print("⚠️ No models found in output directory to optimize.")
+        return
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "." + os.pathsep + env.get("PYTHONPATH", "")
+    
+    cmd = [
+        sys.executable,
+        str(SCRIPTS_DIR / "optimize_for_xnnpack.py"),
+        "--input_dir", str(OUTPUT_DIR),
+        "--output_dir", str(OUTPUT_DIR)
+    ]
+    
+    try:
+        subprocess.run(cmd, check=True, env=env)
+        print(f"✅ Optimization Success!")
+    except subprocess.CalledProcessError:
+        print("❌ Optimization Failed")
+
 def run_quantization():
     print(f"\n--- [Optional] Running Quantization ---")
     
@@ -136,6 +159,7 @@ import argparse
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Export Script for PocketTTS")
+    parser.add_argument("--optimize", action="store_true", help="Optimize models for XNNPACK/Android")
     parser.add_argument("--quantize", action="store_true", help="Run INT8 quantization after export")
     args = parser.parse_args()
 
@@ -143,6 +167,9 @@ if __name__ == "__main__":
     download_weights()
     run_export_scripts()
     
+    if args.optimize:
+        run_optimization()
+        
     if args.quantize:
         run_quantization()
         
