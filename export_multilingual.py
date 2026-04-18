@@ -32,6 +32,53 @@ def parse_hf_url(url):
     
     return repo_id, filename, revision
 
+def hf_download(url, target_dir, target_filename):
+    """Downloads a file from Hugging Face and saves it to a specific local path."""
+    parsed = parse_hf_url(url)
+    if not parsed:
+        print(f"Error: Could not parse Hugging Face URL: {url}")
+        return False
+        
+    repo_id, filename, revision = parsed
+    print(f"Downloading {filename} from {repo_id}@{revision or 'main'}...")
+    
+    try:
+        # Ensure target_dir exists
+        target_dir.mkdir(parents=True, exist_ok=True)
+        
+        downloaded_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            revision=revision,
+            local_dir=target_dir,
+            local_dir_use_symlinks=False
+        )
+        
+        target_path = target_dir / target_filename
+        if Path(downloaded_path) != target_path:
+            # Move/rename the downloaded file to the target filename
+            if target_path.exists():
+                os.remove(target_path)
+            shutil.move(downloaded_path, target_path)
+            
+            # Cleanup potentially empty subdirectories created by hf_hub_download
+            parts = filename.split("/")
+            if len(parts) > 1:
+                subfolder = target_dir / parts[0]
+                if subfolder.exists() and subfolder.is_dir():
+                    shutil.rmtree(subfolder)
+                    
+        # Remove .cache directory if it was created in the local_dir
+        cache_dir = target_dir / ".cache"
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+            
+        print(f"Successfully downloaded to {target_path}")
+        return True
+    except Exception as e:
+        print(f"Failed to download: {e}")
+        return False
+
 def download_safetensors(lang_name, config_path, lang_dir):
     """Downloads model.safetensors if missing using info from config YAML"""
     print(f"Weights missing. Attempting to download for {lang_name}...")
@@ -49,47 +96,34 @@ def download_safetensors(lang_name, config_path, lang_dir):
             print(f"Error: 'weights_path' not found in {config_path}")
             return False
             
-        parsed = parse_hf_url(weights_url)
-        if not parsed:
-            print(f"Error: Could not parse Hugging Face URL: {weights_url}")
+        return hf_download(weights_url, lang_dir, "model.safetensors")
+    except Exception as e:
+        print(f"Error reading config for weights: {e}")
+        return False
+
+def download_tokenizer(lang_name, config_path, lang_dir):
+    """Downloads tokenizer.model if missing using info from config YAML"""
+    print(f"Tokenizer missing. Attempting to download for {lang_name}...")
+    
+    if not config_path.exists():
+        print(f"Error: Config {config_path} not found. Cannot download.")
+        return False
+        
+    try:
+        with open(config_path, "r") as f:
+            config = yaml.safe_load(f)
+            
+        flow_lm = config.get("flow_lm", {})
+        lookup_table = flow_lm.get("lookup_table", {})
+        tokenizer_url = lookup_table.get("tokenizer_path")
+        
+        if not tokenizer_url:
+            print(f"Error: 'flow_lm.lookup_table.tokenizer_path' not found in {config_path}")
             return False
             
-        repo_id, filename, revision = parsed
-        
-        print(f"Downloading {filename} from {repo_id}@{revision or 'main'}...")
-        
-        # Ensure lang_dir exists
-        lang_dir.mkdir(parents=True, exist_ok=True)
-        
-        downloaded_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=filename,
-            revision=revision,
-            local_dir=lang_dir,
-            local_dir_use_symlinks=False
-        )
-        
-        target_path = lang_dir / "model.safetensors"
-        if Path(downloaded_path) != target_path:
-            # If the filename in HF isn't 'model.safetensors', move/rename it
-            shutil.move(downloaded_path, target_path)
-            
-            # Cleanup potentially empty subdirectories created by hf_hub_download
-            parts = filename.split("/")
-            if len(parts) > 1:
-                subfolder = lang_dir / parts[0]
-                if subfolder.exists() and subfolder.is_dir():
-                    shutil.rmtree(subfolder)
-                    
-        # Remove .cache directory if it was created in the local_dir
-        cache_dir = lang_dir / ".cache"
-        if cache_dir.exists():
-            shutil.rmtree(cache_dir)
-            
-        print(f"Successfully downloaded weights to {target_path}")
-        return True
+        return hf_download(tokenizer_url, lang_dir, "tokenizer.model")
     except Exception as e:
-        print(f"Failed to download weights: {e}")
+        print(f"Error reading config for tokenizer: {e}")
         return False
 
 def run_cmd(cmd, env):
@@ -219,11 +253,16 @@ def main():
         config_path = CONFIG_DIR / f"{lang_name}.yaml"
         weights_path = lang_dir / "model.safetensors"
         
-        # Auto-setup: Ensure folder and weights exist
+        # Auto-setup: Ensure folder, weights and tokenizer exist
         if not weights_path.exists():
             if not download_safetensors(lang_name, config_path, lang_dir):
                 print(f"Skipping {lang_name} due to missing weights.")
                 continue
+
+        tokenizer_path = lang_dir / "tokenizer.model"
+        if not tokenizer_path.exists():
+            if not download_tokenizer(lang_name, config_path, lang_dir):
+                print(f"Warning: Could not download tokenizer for {lang_name}. Export might fail if not in cache.")
         
         if export_language(lang_dir):
             processed_count += 1
