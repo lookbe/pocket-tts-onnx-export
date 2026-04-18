@@ -1,9 +1,11 @@
-# sig: b6369a24
+# sig: a0ac5076.yaml
 
-weights_path: hf://kyutai/pocket-tts/tts_b6369a24.safetensors@427e3d61b276ed69fdd03de0d185fa8a8d97fc5b
-weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/tts_b6369a24.safetensors@d4fdd22ae8c8e1cb3634e150ebeff1dab2d16df3
+weights_path: hf://kyutai/pocket-tts/languages/english_v2/model.safetensors@4079fd73cbd1e83cfd47b8fe87c2b5765ab67a0c
+weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/languages/english_v2/model.safetensors@4079fd73cbd1e83cfd47b8fe87c2b5765ab67a0c
+
 
 flow_lm:
+  insert_bos_before_voice: true
   dtype: float32
   flow:
     depth: 6
@@ -19,11 +21,13 @@ flow_lm:
     n_bins: 4000
     tokenizer: sentencepiece
     tokenizer_path: hf://kyutai/pocket-tts-without-voice-cloning/tokenizer.model@d4fdd22ae8c8e1cb3634e150ebeff1dab2d16df3
-  #weights_path: flow_lm_b6369a24.safetensors
+  #weights_path: final.safetensors
 
 mimi:
   dtype: float32
   sample_rate: 24000
+  inner_dim: 32
+  outer_dim: 512
   channels: 1
   frame_rate: 12.5
   seanet:
@@ -54,4 +58,4 @@ mimi:
   quantizer:
     dimension: 32
     output_dimension: 512
-  #weights_path: mimi_b6369a24.safetensors
+  #weights_path: codec.safetensors

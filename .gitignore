@@ -10,9 +10,11 @@ weights/
 # Exported Models
 onnx/
 onnx_models/
+models/
 
 # Generated Audio
 *.wav
 
 # Misc
 .DS_Store
+/models

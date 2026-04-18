@@ -127,97 +127,42 @@ class MimiWrapper(nn.Module):
         else:
             self.register_buffer("emb_mean", torch.zeros(1))
 
-    def forward(self, latent, k_block, v_block, conv_states_flat):
-        # 1. Un-normalize latent
+    def forward(self, latent, flat_state):
+        # Un-normalize latent: scale and shift back
+        # latent is (B, T, 32), emb_std/mean are (32)
         mimi_decoding_input = latent * self.emb_std + self.emb_mean
+        
+        # Transpose: [B, T, D] -> [B, D, T]
         transposed = mimi_decoding_input.transpose(-1, -2)
+        
+        # Project: [B, dim, T]
         quantized = self.mimi.quantizer(transposed)
         
-        # 2. Reconstruct model state from grouped blocks
-        model_state = {}
+        # Unflatten state
+        model_state, _ = unflatten_state(flat_state, self.state_structure)
         
-        # We assume fixed structure for Mimi
-        # First group: Transformer KV Caches
-        attn_layer_idx = 0
-        from pocket_tts.modules.transformer import StreamingMultiheadAttention
-        from pocket_tts.modules.mimi_transformer import MimiStreamingMultiheadAttention
-        from pocket_tts.modules.conv import StreamingConv1d, StreamingConvTranspose1d
-
-        idx = 0
-        for name, m in self.mimi.named_modules():
-            if isinstance(m, (StreamingMultiheadAttention, MimiStreamingMultiheadAttention)):
-                 # For Mimi, we need offset, cache, and end_offset
-                 if isinstance(m, MimiStreamingMultiheadAttention):
-                     # These come from conv_states_flat for now or we group them too
-                     # But for simplicity, let's assume they are the first few after transformer blocks?
-                     # No, let's just group them into the blocks if possible.
-                     
-                     # Re-evaluating: Mimi states: cache (in blocks), offset (scalar), end_offset (scalar)
-                     # For now, let's assume they are appended to conv_states_flat
-                     model_state[name] = {
-                         "cache": torch.stack([k_block[attn_layer_idx], v_block[attn_layer_idx]], dim=0),
-                         "offset": conv_states_flat[idx],
-                         "end_offset": conv_states_flat[idx+1]
-                     }
-                     idx += 2
-                 else:
-                     model_state[name] = {
-                         "cache": torch.stack([k_block[attn_layer_idx], v_block[attn_layer_idx]], dim=0),
-                         "step": conv_states_flat[idx] # StreamingMultiheadAttention uses 'step'
-                     }
-                     idx += 1
-                 attn_layer_idx += 1
-            elif isinstance(m, (StreamingConv1d, StreamingConvTranspose1d)):
-                 if isinstance(m, StreamingConv1d):
-                     model_state[name] = {
-                         "previous": conv_states_flat[idx],
-                         "first": conv_states_flat[idx+1]
-                     }
-                     idx += 2
-                 else:
-                     model_state[name] = {
-                         "partial": conv_states_flat[idx]
-                     }
-                     idx += 1
-
-        # 3. Decode
+        # Decode
         audio_frame = self.mimi.decode_from_latent(quantized, model_state)
+
+        if torch.jit.is_tracing():
+            from torch.onnx import operators
+            seq_len = operators.shape_as_tensor(latent)[1]
+        else:
+            seq_len = latent.shape[1]
         
-        # 4. Increment and pack back into grouped blocks
-        seq_len = latent.shape[1]
+        # Increment by the hop factor (200Hz transformer / 12.5Hz latent = 16)
         increment = seq_len * 16
         increment_steps(self.mimi, model_state, increment=increment)
         
-        new_k_list = []
-        new_v_list = []
-        new_conv_list = []
+        new_flat_state = flatten_state(model_state)
         
-        for name, m in self.mimi.named_modules():
-            if isinstance(m, (StreamingMultiheadAttention, MimiStreamingMultiheadAttention)):
-                 new_k_list.append(model_state[name]["cache"][0])
-                 new_v_list.append(model_state[name]["cache"][1])
-                 if isinstance(m, MimiStreamingMultiheadAttention):
-                     new_conv_list.append(model_state[name]["offset"])
-                     new_conv_list.append(model_state[name]["end_offset"])
-                 else:
-                     new_conv_list.append(model_state[name]["step"])
-            elif isinstance(m, StreamingConv1d):
-                 new_conv_list.append(model_state[name]["previous"])
-                 new_conv_list.append(model_state[name]["first"])
-            elif isinstance(m, StreamingConvTranspose1d):
-                 new_conv_list.append(model_state[name]["partial"])
-                 
-        return (
-            audio_frame, 
-            torch.stack(new_k_list, dim=0), 
-            torch.stack(new_v_list, dim=0),
-            *new_conv_list
-        )
+        return (audio_frame, *new_flat_state)
+
 
 
 class MimiEncoderWrapper(nn.Module):
-    """Wrapper for Mimi encoder that takes raw audio and returns latent embeddings."""
-    def __init__(self, mimi: MimiModel, speaker_proj_weight=None):
+    """Wrapper for Mimi encoder that handles speaker normalization and projection."""
+    def __init__(self, mimi: MimiModel, speaker_proj_weight=None, emb_std=None, emb_mean=None):
         super().__init__()
         self.mimi = mimi
         if speaker_proj_weight is not None:
@@ -225,17 +170,33 @@ class MimiEncoderWrapper(nn.Module):
         else:
             self.speaker_proj_weight = None
 
+        if emb_std is not None:
+            self.register_buffer("emb_std", emb_std)
+        else:
+            self.register_buffer("emb_std", torch.ones(1))
+            
+        if emb_mean is not None:
+            self.register_buffer("emb_mean", emb_mean)
+        else:
+            self.register_buffer("emb_mean", torch.zeros(1))
+
+
     def forward(self, audio):
-        # audio: [B, C, T] -> latent: [B, T', D]
+        # audio: [B, C, T] -> latent: [B, T', 32]
         encoded = self.mimi.encode_to_latent(audio)
-        # encoded is [B, D, T'], we need [B, T', D]
+        # encoded is [B, 32, T'], we need [B, T', 32]
         latents = encoded.transpose(-1, -2)
+        
+        # NO normalization here. The PyTorch reference (_encode_audio in tts_model.py)
+        # projects raw 32-dim latents directly: F.linear(latents, speaker_proj_weight)
+        # emb_mean/emb_std are only used on the DECODER side to un-normalize.
         
         # Apply speaker projection if available
         if self.speaker_proj_weight is not None:
             latents = torch.nn.functional.linear(latents, self.speaker_proj_weight)
         
         return latents
+
 
 
 class TextConditionerWrapper(nn.Module):

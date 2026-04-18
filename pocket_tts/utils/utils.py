@@ -1,22 +1,44 @@
 import hashlib
 import logging
+import os
 import time
 from pathlib import Path
 
 import requests
-import safetensors.torch
 import torch
 from huggingface_hub import hf_hub_download
 from torch import nn
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
+DEBUG_MIMI = os.environ.get("DEBUG_MIMI", "0") == "1"
 
-_voices_names = ["alba", "marius", "javert", "jean", "fantine", "cosette", "eponine", "azelma"]
-PREDEFINED_VOICES = {
-    # don't forget to change this
-    x: f"hf://kyutai/pocket-tts-without-voice-cloning/embeddings/{x}.safetensors@d4fdd22ae8c8e1cb3634e150ebeff1dab2d16df3"
-    for x in _voices_names
+_ORIGINS_OF_PREDEFINED_VOICES = {
+    "cosette": "hf://kyutai/tts-voices/expresso/ex04-ex02_confused_001_channel1_499s.wav",
+    "marius": "hf://kyutai/tts-voices/voice-donations/Selfie.wav",
+    "javert": "hf://kyutai/tts-voices/voice-donations/Butter.wav",
+    "alba": "hf://kyutai/tts-voices/alba-mackenna/casual.wav",
+    "jean": "hf://kyutai/tts-voices/ears/p010/freeform_speech_01_enhanced.wav",
+    "anna": "hf://kyutai/tts-voices/vctk/p228_023_enhanced.wav",
+    "vera": "hf://kyutai/tts-voices/vctk/p229_023_enhanced.wav",
+    "fantine": "hf://kyutai/tts-voices/vctk/p244_023_enhanced.wav",
+    "charles": "hf://kyutai/tts-voices/vctk/p254_023_enhanced.wav",
+    "paul": "hf://kyutai/tts-voices/vctk/p259_023_enhanced.wav",
+    "eponine": "hf://kyutai/tts-voices/vctk/p262_023_enhanced.wav",
+    "azelma": "hf://kyutai/tts-voices/vctk/p303_023_enhanced.wav",
+    "george": "hf://kyutai/tts-voices/vctk/p315_023_enhanced.wav",
+    "mary": "hf://kyutai/tts-voices/vctk/p333_023_enhanced.wav",
+    "jane": "hf://kyutai/tts-voices/vctk/p339_023_enhanced.wav",
+    "michael": "hf://kyutai/tts-voices/vctk/p360_023_enhanced.wav",
+    "eve": "hf://kyutai/tts-voices/vctk/p361_023_enhanced.wav",
+    "bill_boerst": "hf://kyutai/tts-voices/voice-zero/bill_boerst.wav",
+    "peter_yearsley": "hf://kyutai/tts-voices/voice-zero/peter_yearsley.wav",
+    "stuart_bell": "hf://kyutai/tts-voices/voice-zero/stuart_bell.wav",
+    "caro_davy": "hf://kyutai/tts-voices/voice-zero/caro_davy.wav",
 }
+
+
+def get_predefined_voice(language: str, name: str) -> str:
+    return f"hf://kyutai/pocket-tts/languages/{language}/embeddings/{name}.safetensors@25443bdc51dd9d08cca86e0f080d25e8a05c39b3"
 
 
 def make_cache_directory() -> Path:
@@ -90,14 +112,3 @@ def download_if_necessary(file_path: str) -> Path:
         return Path(cached_file)
     else:
         return Path(file_path)
-
-
-def load_predefined_voice(voice_name: str) -> torch.Tensor:
-    if voice_name not in PREDEFINED_VOICES:
-        raise ValueError(
-            f"Predefined voice '{voice_name}' not found"
-            f", available voices are {list(PREDEFINED_VOICES)}."
-        )
-    voice_file = download_if_necessary(PREDEFINED_VOICES[voice_name])
-    # There is only one tensor in the file.
-    return safetensors.torch.load_file(voice_file)["audio_prompt"]
