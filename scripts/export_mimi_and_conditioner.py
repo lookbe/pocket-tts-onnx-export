@@ -28,6 +28,7 @@ import argparse
 import torch
 import torch.nn.functional as F
 import math
+import onnx
 # Monkeypatch trunc_normal_ to be ONNX-friendly
 def patched_trunc_normal_(tensor, mean=0., std=1., a=-2., b=2.):
     # Use normal distribution clamped to range.
@@ -47,8 +48,9 @@ def patched_increment_steps(module, model_state, increment=1):
     for module_name, m in module.named_modules():
         if not isinstance(m, StatefulModule):
             continue
-        # Call patched increment_step on module
-        m.increment_step(model_state[module_name], increment)
+        # Skip if module state is not present (e.g. filtered decoder-only states)
+        if module_name in model_state:
+            m.increment_step(model_state[module_name], increment)
 
 stateful_module.increment_steps = patched_increment_steps
 
@@ -58,16 +60,20 @@ from pocket_tts.modules.transformer import StreamingMultiheadAttention
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
-    dtype = self.in_proj.weight.dtype
-    # Use a tensor 'offset' for position tracking to avoid .item() during tracing
+    dtype = torch.float16
     return dict(
-        cache=torch.full(
-            (2, batch_size, sequence_length, self.num_heads, self.dim_per_head),
-            float("NaN"),
+        cache_k=torch.full(
+            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
+            0.0,
             device=device,
             dtype=dtype,
         ),
-        current_end=torch.zeros(0, device=device, dtype=dtype),
+        cache_v=torch.full(
+            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
+            0.0,
+            device=device,
+            dtype=dtype,
+        ),
         step=torch.zeros(batch_size, dtype=torch.long, device=device),
     )
 
@@ -76,37 +82,30 @@ def patched_increment_step(self, state: dict, increment: int = 1):
 
 def patched_append_and_get(self, k, v, state):
     if state is None:
-        k_attn = k.permute(0, 2, 1, 3)
-        v_attn = v.permute(0, 2, 1, 3)
-        pos_k = torch.arange(k_attn.shape[2], device=k_attn.device, dtype=torch.long)
-        pos_k = pos_k.view(1, -1).expand(k_attn.shape[0], -1)
+        k_attn = k.permute(0, 2, 1, 3); v_attn = v.permute(0, 2, 1, 3)
+        pos_k = torch.arange(k_attn.shape[2], device=k_attn.device, dtype=torch.long).view(1, -1).expand(k_attn.shape[0], -1)
         step = torch.zeros(k_attn.shape[0], device=k_attn.device, dtype=torch.long)
         return k_attn, v_attn, pos_k, step
 
-    cache = state["cache"]
+    cache_k = state["cache_k"]
+    cache_v = state["cache_v"]
     step = state["step"]
-    # step is [B], assume B=1 for export and use first element
     off = step.view(-1)[0]
     
-    # Out-of-place update for ONNX
-    new_cache = cache.clone()
-    # Slicing with tensors is supported in recent ONNX exporters
-    new_cache[0, :, off : off + k.shape[1]] = k
-    new_cache[1, :, off : off + v.shape[1]] = v
-    state["cache"] = new_cache
+    B, L, H, D = k.shape
+    indices = (off + torch.arange(L, device=k.device, dtype=torch.long)).view(1, L, 1, 1).expand(B, L, H, D)
     
-    valid_len = off + k.shape[1]
-    cache_k = new_cache[0, :, :valid_len]
-    cache_v = new_cache[1, :, :valid_len]
+    updated_k = cache_k.scatter(1, indices, k.half())
+    updated_v = cache_v.scatter(1, indices, v.half())
+    state["cache_k"] = updated_k
+    state["cache_v"] = updated_v
     
-    k_attn = cache_k.permute(0, 2, 1, 3)
-    v_attn = cache_v.permute(0, 2, 1, 3)
+    valid_len = off + L
+    k_attn = updated_k[:, :valid_len].permute(0, 2, 1, 3).float()
+    v_attn = updated_v[:, :valid_len].permute(0, 2, 1, 3).float()
     
-    # Traceable pos_k: use a large buffer and slice
     MAX_POS = 4096
-    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0)
-    pos_k = pos_k.expand(k_attn.shape[0], -1)
-    
+    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(B, -1)
     return k_attn, v_attn, pos_k, step
 
 def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
@@ -155,6 +154,19 @@ StreamingMultiheadAttention.forward = patched_sma_forward
 # Monkeypatch MimiStreamingMultiheadAttention logic
 from pocket_tts.modules.mimi_transformer import MimiStreamingMultiheadAttention, KVCacheResult
 
+def patched_mimi_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
+    dim_per_head = self.embed_dim // self.num_heads
+    device = self.in_proj.weight.device
+    dtype = torch.float16
+    capacity = 250
+    return dict(
+        offset=torch.zeros(batch_size, dtype=torch.long, device=device),
+        cache_k=torch.zeros((batch_size, capacity, self.num_heads, dim_per_head), dtype=dtype, device=device),
+        cache_v=torch.zeros((batch_size, capacity, self.num_heads, dim_per_head), dtype=dtype, device=device),
+    )
+
+MimiStreamingMultiheadAttention.init_state = patched_mimi_init_state
+
 def patched_mimi_increment_step(self, state: dict, increment: int = 1):
     state["offset"] = state["offset"] + increment
 
@@ -165,42 +177,37 @@ def patched_mimi_complete_kv(self, k, v, model_state: dict | None):
         return KVCacheResult.from_kv(k, v)
         
     layer_state = self.get_state(model_state)
-    cache = layer_state["cache"]
-    end_offset = layer_state["end_offset"]
+    cache_k = layer_state["cache_k"]
+    cache_v = layer_state["cache_v"]
+    offset = layer_state["offset"]
     
-    capacity = cache.shape[3]
+    capacity = cache_k.shape[1]
     B, H, T, D = k.shape
     
-    new_cache = cache.clone()
-    new_end_offset = end_offset.clone()
+    # k/v come in [B, H, T, D]; store cache as [B, T, H, D].
+    k_store = k.permute(0, 2, 1, 3)
+    v_store = v.permute(0, 2, 1, 3)
+    indexes = (offset.view(-1, 1) + torch.arange(T, device=offset.device, dtype=offset.dtype)) % capacity
+    this_indexes = indexes.view(B, T, 1, 1).expand(-1, T, H, D)
     
-    indexes = torch.arange(T, device=end_offset.device, dtype=end_offset.dtype)
-    indexes = indexes + end_offset.view(-1, 1)
-    indexes = indexes % capacity
+    # Update cache (out-of-place for ONNX tracing)
+    updated_k = cache_k.scatter(1, this_indexes, k_store.half())
+    updated_v = cache_v.scatter(1, this_indexes, v_store.half())
     
-    this_indexes = indexes.view(B, 1, T, 1)
-    this_indexes = this_indexes.expand(-1, H, T, D)
+    layer_state["cache_k"] = updated_k
+    layer_state["cache_v"] = updated_v
     
-    new_cache[0].scatter_(2, this_indexes, k)
-    new_cache[1].scatter_(2, this_indexes, v)
-    
-    keys = new_cache[0]
-    values = new_cache[1]
-    
-    indexes_r = torch.arange(capacity, device=end_offset.device, dtype=torch.long)
-    last_offset = end_offset.view(-1, 1) + T - 1
+    indexes_r = torch.arange(capacity, device=offset.device, dtype=torch.long)
+    last_offset = offset.view(-1, 1) + T - 1
     end_index = last_offset % capacity
     delta = indexes_r - end_index
     
     positions = torch.where(delta <= 0, last_offset + delta, last_offset + delta - capacity)
-    new_end_offset[:] = end_offset + T
-    
-    invalid = indexes_r >= new_end_offset.view(-1, 1)
+    invalid = indexes_r >= (offset + T).view(-1, 1)
     positions = torch.where(invalid, torch.full_like(positions, -1), positions)
     
-    layer_state["cache"] = new_cache
-    layer_state["end_offset"] = new_end_offset
-    
+    keys = updated_k.permute(0, 2, 1, 3).float()
+    values = updated_v.permute(0, 2, 1, 3).float()
     return KVCacheResult(keys, values, positions)
 
 MimiStreamingMultiheadAttention._complete_kv = patched_mimi_complete_kv
@@ -212,6 +219,50 @@ from pocket_tts.models.tts_model import TTSModel
 from pocket_tts.default_parameters import DEFAULT_LANGUAGE
 from pocket_tts.modules.stateful_module import init_states
 from onnx_export.export_utils import get_state_structure, flatten_state, unflatten_state
+
+EXPECTED_MIMI_STATE_COUNT = 56
+EXPECTED_MIMI_MAX_STATE_INDEX = 55
+
+def filter_mimi_states(states: dict) -> dict:
+    """Filter Mimi states to only include modules used during decoding."""
+    decoder_top_modules = ["decoder", "decoder_transformer", "upsample"]
+    return {
+        k: v for k, v in states.items() 
+        if k.split('.')[0] in decoder_top_modules
+    }
+
+def assert_mimi_state_contract_from_flat(flat_mimi_state):
+    count = len(flat_mimi_state)
+    if count != EXPECTED_MIMI_STATE_COUNT:
+        raise RuntimeError(
+            f"Mimi state contract mismatch before export: got {count} states, "
+            f"expected {EXPECTED_MIMI_STATE_COUNT}. "
+            "This would break the web/C++ runner state feeds."
+        )
+
+def assert_mimi_state_contract_from_onnx(mimi_onnx_path: str):
+    model = onnx.load(mimi_onnx_path)
+    state_inputs = []
+    for i in model.graph.input:
+        if i.name.startswith("state_"):
+            try:
+                idx = int(i.name.split("_", 1)[1])
+            except Exception:
+                continue
+            state_inputs.append((idx, i))
+
+    if len(state_inputs) != EXPECTED_MIMI_STATE_COUNT:
+        raise RuntimeError(
+            f"Mimi ONNX state contract mismatch: model has {len(state_inputs)} state inputs, "
+            f"expected {EXPECTED_MIMI_STATE_COUNT}."
+        )
+
+    max_idx = max(idx for idx, _ in state_inputs)
+    if max_idx != EXPECTED_MIMI_MAX_STATE_INDEX:
+        raise RuntimeError(
+            f"Mimi ONNX state index mismatch: max state index is {max_idx}, "
+            f"expected {EXPECTED_MIMI_MAX_STATE_INDEX}."
+        )
 
 from pocket_tts.modules.conv import StreamingConv1d, StreamingConvTranspose1d
 def patched_conv1d_forward(self, x, model_state: dict | None):
@@ -391,8 +442,10 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     print("Exporting Mimi...")
     
     mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=STATIC_SEQ_LEN)
+    
     mimi_structure = get_state_structure(mimi_state)
     flat_mimi_state = flatten_state(mimi_state)
+    assert_mimi_state_contract_from_flat(flat_mimi_state)
     
     
     mimi_wrapper = MimiWrapper(
@@ -410,7 +463,9 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     
     # Mimi dynamic axes
     mimi_dynamic_axes = {
-        "latent": {1: "seq_len"}
+        "latent": {1: "seq_len"},
+        # decode_from_latent outputs flattened audio samples: seq_len * 1920
+        "audio_frame": {0: "num_samples"},
     }
     
     mimi_onnx_path = os.path.join(output_dir, "mimi_decoder.onnx")
@@ -425,6 +480,7 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
         opset_version=17,
         dynamo=False
     )
+    assert_mimi_state_contract_from_onnx(mimi_onnx_path)
     print(f"Mimi exported to {mimi_onnx_path}")
     
     # Note: BOS before voice is now embedded in flow_lm_main.onnx
@@ -464,7 +520,7 @@ def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
         
         np.testing.assert_allclose(
             pt_encoder_out.numpy(), onnx_encoder_out, 
-            rtol=1e-4, atol=1e-4
+            rtol=1e-3, atol=1e-3
         )
         print("Mimi Encoder output matches!")
     
@@ -520,19 +576,32 @@ def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
         ort_mimi_inputs = {
             "latent": latent.numpy()
         }
+        input_info_objs = {i.name: i for i in ort_session_mimi.get_inputs()}
         for i, state_tensor in enumerate(flat_mimi_state):
-            ort_mimi_inputs[f"state_{i}"] = state_tensor.numpy()
+            name = f"state_{i}"
+            if name in input_info_objs:
+                val = state_tensor.numpy()
+                t = input_info_objs[name].type
+                if t == 'tensor(float16)':
+                    val = val.astype(np.float16)
+                elif t == 'tensor(float)':
+                    val = val.astype(np.float32)
+                elif t == 'tensor(int64)':
+                    val = val.astype(np.int64)
+                elif t == 'tensor(bool)':
+                    val = val.astype(bool)
+                ort_mimi_inputs[name] = val
             
         ort_mimi_outs = ort_session_mimi.run(None, ort_mimi_inputs)
         
         onnx_audio = ort_mimi_outs[0]
         onnx_mimi_states = ort_mimi_outs[1:]
         
-        np.testing.assert_allclose(pt_audio, onnx_audio, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(pt_audio, onnx_audio, rtol=1e-3, atol=1e-3)
         print("Mimi audio output matches!")
         
         for i, (pt_s, onnx_s) in enumerate(zip(pt_mimi_states, onnx_mimi_states)):
-            np.testing.assert_allclose(pt_s, onnx_s, rtol=1e-4, atol=1e-4)
+            np.testing.assert_allclose(pt_s, onnx_s, rtol=1e-3, atol=1e-3)
         print("Mimi states match!")
         
         print("Verification successful!")

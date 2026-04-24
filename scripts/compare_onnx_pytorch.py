@@ -152,21 +152,23 @@ def compare_flow_lm_main(ort_session, pt_wrapper, tts_model):
 
 def compare_flow_lm_flow(ort_session, pt_wrapper, tts_model):
     print("\n--- Comparing Flow LM FlowNet ---")
-    c = torch.randn(1, 1024)
+    # c(1024) is rank 1, s(1,1), t(1,1), x(1,32) are rank 2
+    c = torch.randn(1024)
     s = torch.tensor([[0.0]])
     t = torch.tensor([[0.1]])
     x = torch.randn(1, 32)
     
     with torch.no_grad():
         pt_out = pt_wrapper(c, s, t, x).numpy()
-        
-    onnx_out = ort_session.run(None, {
-        "c": c.numpy(),
-        "s": s.numpy(),
-        "t": t.numpy(),
-        "x": x.numpy()
-    })[0]
     
+    input_types = get_session_input_types(ort_session)
+    ort_inputs = {
+        "c": cast_to_ort_type(c.numpy(), input_types["c"]),
+        "s": cast_to_ort_type(s.numpy(), input_types["s"]),
+        "t": cast_to_ort_type(t.numpy(), input_types["t"]),
+        "x": cast_to_ort_type(x.numpy(), input_types["x"]),
+    }
+    onnx_out = ort_session.run(None, ort_inputs)[0]
     assert_allclose_with_logging("FlowNet Latent Match", pt_out, onnx_out)
 
 def compare_mimi_decoder(ort_session, pt_wrapper, tts_model):
@@ -225,15 +227,21 @@ import torch.nn.functional as F
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
-    dtype = self.in_proj.weight.dtype
+    # Match export dtype: FP16
+    dtype = torch.float16
     return dict(
-        cache=torch.full(
-            (2, batch_size, sequence_length, self.num_heads, self.dim_per_head),
-            float("NaN"),
+        cache_k=torch.full(
+            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
+            0.0,
             device=device,
             dtype=dtype,
         ),
-        current_end=torch.zeros(0, device=device, dtype=dtype),
+        cache_v=torch.full(
+            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
+            0.0,
+            device=device,
+            dtype=dtype,
+        ),
         step=torch.zeros(batch_size, dtype=torch.long, device=device),
     )
 
@@ -247,21 +255,25 @@ def patched_append_and_get(self, k, v, state):
         step = torch.zeros(k_attn.shape[0], device=k_attn.device, dtype=torch.long)
         return k_attn, v_attn, pos_k, step
 
-    cache = state["cache"]
+    cache_k = state["cache_k"]
+    cache_v = state["cache_v"]
     step = state["step"]
     off = step.view(-1)[0]
     
-    new_cache = cache.clone()
-    new_cache[0, :, off : off + k.shape[1]] = k
-    new_cache[1, :, off : off + v.shape[1]] = v
-    state["cache"] = new_cache
+    B, L, H, D = k.shape
+    indices = (off + torch.arange(L, device=k.device, dtype=torch.long)).view(1, L, 1, 1).expand(B, L, H, D)
     
-    valid_len = off + k.shape[1]
-    k_attn = new_cache[0, :, :valid_len].permute(0, 2, 1, 3)
-    v_attn = new_cache[1, :, :valid_len].permute(0, 2, 1, 3)
+    updated_k = cache_k.scatter(1, indices, k.half())
+    updated_v = cache_v.scatter(1, indices, v.half())
+    state["cache_k"] = updated_k
+    state["cache_v"] = updated_v
+    
+    valid_len = off + L
+    k_attn = updated_k[:, :valid_len].permute(0, 2, 1, 3).float()
+    v_attn = updated_v[:, :valid_len].permute(0, 2, 1, 3).float()
     
     MAX_POS = 4096
-    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(k_attn.shape[0], -1)
+    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(B, -1)
     return k_attn, v_attn, pos_k, step
 
 def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):

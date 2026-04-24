@@ -156,7 +156,8 @@ class MimiWrapper(nn.Module):
         
         new_flat_state = flatten_state(model_state)
         
-        return (audio_frame, *new_flat_state)
+        # Squeeze to rank 1 for consistency with sample-based streaming
+        return (audio_frame.squeeze(), *new_flat_state)
 
 
 
