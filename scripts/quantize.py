@@ -20,7 +20,7 @@ def quantize_file(input_path: Path, output_path: Path, op_types=None):
         print(f"Skipping {input_path.name} (not found)")
         return
 
-    print(f"Quantizing {input_path.name}...")
+    print(f"Quantizing {input_path.name} (per_channel=True)...")
     temp_path = None
     try:
         print("  Running shape inference...")
@@ -35,6 +35,7 @@ def quantize_file(input_path: Path, output_path: Path, op_types=None):
             model_output=str(output_path),
             weight_type=QuantType.QInt8,
             op_types_to_quantize=op_types,
+            per_channel=True,
             extra_options={"ForceQuantizeNoType": True, "DefaultTensorType": 1},
         )
 
@@ -68,7 +69,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Starting Quantization: {input_dir} -> {output_dir}")
-    print("Using dynamic MatMul-only quantization for CPU compatibility.")
+    print("Using dynamic MatMul-only quantization (per_channel=True) for CPU compatibility.")
 
     for model_name in MODELS_TO_QUANTIZE:
         in_file = input_dir / f"{model_name}.onnx"
