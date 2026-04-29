@@ -8,19 +8,32 @@ MODELS_TO_QUANTIZE = [
     "flow_lm_main",
     "flow_lm_flow",
     "mimi_decoder",
-    "mimi_encoder",
-    "text_conditioner",
 ]
 
 
-def quantize_file(input_path: Path, output_path: Path, op_types=None):
+def quantize_file(input_path: Path, output_path: Path, model_name: str):
     """Quantize a single ONNX file using dynamic quantization."""
-    op_types = op_types or ["MatMul"]
     if not input_path.exists():
         print(f"Skipping {input_path.name} (not found)")
         return
 
-    print(f"Quantizing {input_path.name} (per_channel=True)...")
+    print(f"Quantizing {input_path.name} (model_name={model_name})...")
+    
+    # Selective node quantization logic
+    nodes_to_quantize = []
+    if model_name == "flow_lm_main":
+        print("  Applying selective node quantization (Transformer backbone)...")
+        model = onnx.load(str(input_path))
+        for node in model.graph.node:
+            if node.op_type in ["MatMul", "Gemm"]:
+                name = node.name
+                # Target Transformer layers: in_proj, out_proj, linear1, linear2
+                # Skip input_linear and attention score MatMuls (activation*activation)
+                if "/transformer/" in name:
+                    if any(x in name for x in ["/in_proj/", "/out_proj/", "/linear1/", "/linear2/"]):
+                        nodes_to_quantize.append(name)
+        print(f"  Selected {len(nodes_to_quantize)} nodes for quantization.")
+    
     temp_path = None
     try:
         print("  Running shape inference...")
@@ -30,14 +43,21 @@ def quantize_file(input_path: Path, output_path: Path, op_types=None):
         temp_path = output_path.with_suffix(".temp.onnx")
         onnx.save(model, str(temp_path))
 
-        quantize_dynamic(
-            model_input=str(temp_path),
-            model_output=str(output_path),
-            weight_type=QuantType.QInt8,
-            op_types_to_quantize=op_types,
-            per_channel=True,
-            extra_options={"ForceQuantizeNoType": True, "DefaultTensorType": 1},
-        )
+        # If nodes_to_quantize is empty and we are flow_lm_main, it means we found nothing.
+        # If it's empty for other models, quantize_dynamic will use op_types_to_quantize.
+        quant_args = {
+            "model_input": str(temp_path),
+            "model_output": str(output_path),
+            "weight_type": QuantType.QInt8,
+            "op_types_to_quantize": ["MatMul", "Gemm"],
+            "per_channel": True,
+            "extra_options": {"ForceQuantizeNoType": True, "DefaultTensorType": 1},
+        }
+        
+        if nodes_to_quantize:
+            quant_args["nodes_to_quantize"] = nodes_to_quantize
+
+        quantize_dynamic(**quant_args)
 
         size_orig = input_path.stat().st_size / (1024 * 1024)
         size_quant = output_path.stat().st_size / (1024 * 1024)
@@ -69,12 +89,12 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Starting Quantization: {input_dir} -> {output_dir}")
-    print("Using dynamic MatMul-only quantization (per_channel=True) for CPU compatibility.")
+    print("Using dynamic MatMul/Gemm quantization (per_channel=True) for CPU compatibility.")
 
     for model_name in MODELS_TO_QUANTIZE:
         in_file = input_dir / f"{model_name}.onnx"
         out_file = output_dir / f"{model_name}_int8.onnx"
-        quantize_file(in_file, out_file, op_types=["MatMul"])
+        quantize_file(in_file, out_file, model_name)
 
     print("\nQuantization routine finished.")
 

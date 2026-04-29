@@ -181,32 +181,46 @@ def export_language(lang_dir: Path):
     env["PYTHONPATH"] = "." + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
 
-    # 1. Export Mimi & Conditioner
-    print(f"\n[1/3] Exporting Mimi & Text Conditioner for {lang_name}...")
-    mimi_cmd = [
-        sys.executable,
-        str(SCRIPTS_DIR / "export_mimi_and_conditioner.py"),
-        "--output_dir", str(lang_dir),
-        "--weights_path", str(weights_path),
-        "--config", str(config_path)
+    # Check if all base ONNX files exist to skip export steps
+    required_files = [
+        "mimi_encoder.onnx",
+        "text_conditioner.onnx",
+        "mimi_decoder.onnx",
+        "flow_lm_main.onnx",
+        "flow_lm_flow.onnx",
+        "bos_before_voice.npy"
     ]
-    if not run_cmd(mimi_cmd, env): 
-        print(f"FAILED: Mimi/Conditioner Export Failed for {lang_name}")
-        return False
+    all_files_exist = all((lang_dir / f).exists() for f in required_files)
 
-    # 2. Export FlowLM
-    print(f"\n[2/3] Exporting FlowLM (Split Models) for {lang_name}...")
-    flow_cmd = [
-        sys.executable,
-        str(SCRIPTS_DIR / "export_flow_lm.py"),
-        "--output_dir", str(lang_dir),
-        "--weights_path", str(weights_path),
-        "--config", str(config_path)
-    ]
-    
-    if not run_cmd(flow_cmd, env):
-        print(f"FAILED: FlowLM Export Failed for {lang_name}")
-        return False
+    if all_files_exist:
+        print(f"\nSkipping Safetensors -> ONNX export for {lang_name}: All base models already exist.")
+    else:
+        # 1. Export Mimi & Conditioner
+        print(f"\n[1/3] Exporting Mimi & Text Conditioner for {lang_name}...")
+        mimi_cmd = [
+            sys.executable,
+            str(SCRIPTS_DIR / "export_mimi_and_conditioner.py"),
+            "--output_dir", str(lang_dir),
+            "--weights_path", str(weights_path),
+            "--config", str(config_path)
+        ]
+        if not run_cmd(mimi_cmd, env): 
+            print(f"FAILED: Mimi/Conditioner Export Failed for {lang_name}")
+            return False
+
+        # 2. Export FlowLM
+        print(f"\n[2/3] Exporting FlowLM (Split Models) for {lang_name}...")
+        flow_cmd = [
+            sys.executable,
+            str(SCRIPTS_DIR / "export_flow_lm.py"),
+            "--output_dir", str(lang_dir),
+            "--weights_path", str(weights_path),
+            "--config", str(config_path)
+        ]
+        
+        if not run_cmd(flow_cmd, env):
+            print(f"FAILED: FlowLM Export Failed for {lang_name}")
+            return False
 
     # 3. Quantize
     print(f"\n[3/3] Quantizing ONNX models to INT8 for {lang_name}...")
@@ -258,6 +272,8 @@ def main():
             if not download_safetensors(lang_name, config_path, lang_dir):
                 print(f"Skipping {lang_name} due to missing weights.")
                 continue
+        else:
+            print(f"Weights already present for {lang_name}, skipping download.")
 
         tokenizer_path = lang_dir / "tokenizer.model"
         if not tokenizer_path.exists():
