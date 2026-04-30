@@ -54,13 +54,22 @@ def patched_increment_steps(module, model_state, increment=1):
 
 stateful_module.increment_steps = patched_increment_steps
 
+# ==============================================================================
+# 0. CONFIGURATION
+# ==============================================================================
+USE_FLOAT16_STATES = True  # Optimization: Use float16 for states to reduce memory bandwidth by 50%
+
+# ==============================================================================
+# 1. MONKEYPATCHES
+# ==============================================================================
+
 # Monkeypatch StreamingMultiheadAttention and its backend for ONNX tracing
 import pocket_tts.modules.transformer as transformer_module
 from pocket_tts.modules.transformer import StreamingMultiheadAttention
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
-    dtype = torch.float16
+    dtype = torch.float16 if USE_FLOAT16_STATES else torch.float32
     return dict(
         cache_k=torch.full(
             (batch_size, sequence_length, self.num_heads, self.dim_per_head),
@@ -93,10 +102,11 @@ def patched_append_and_get(self, k, v, state):
     off = step.view(-1)[0]
     
     B, L, H, D = k.shape
+    # Optimization: Use scatter for O(1) updates instead of O(N) clones
     indices = (off + torch.arange(L, device=k.device, dtype=torch.long)).view(1, L, 1, 1).expand(B, L, H, D)
     
-    updated_k = cache_k.scatter(1, indices, k.half())
-    updated_v = cache_v.scatter(1, indices, v.half())
+    updated_k = cache_k.scatter(1, indices, k.half() if USE_FLOAT16_STATES else k.float())
+    updated_v = cache_v.scatter(1, indices, v.half() if USE_FLOAT16_STATES else v.float())
     state["cache_k"] = updated_k
     state["cache_v"] = updated_v
     
@@ -157,7 +167,7 @@ from pocket_tts.modules.mimi_transformer import MimiStreamingMultiheadAttention,
 def patched_mimi_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     dim_per_head = self.embed_dim // self.num_heads
     device = self.in_proj.weight.device
-    dtype = torch.float16
+    dtype = torch.float16 if USE_FLOAT16_STATES else torch.float32
     capacity = 250
     return dict(
         offset=torch.zeros(batch_size, dtype=torch.long, device=device),
@@ -191,8 +201,8 @@ def patched_mimi_complete_kv(self, k, v, model_state: dict | None):
     this_indexes = indexes.view(B, T, 1, 1).expand(-1, T, H, D)
     
     # Update cache (out-of-place for ONNX tracing)
-    updated_k = cache_k.scatter(1, this_indexes, k_store.half())
-    updated_v = cache_v.scatter(1, this_indexes, v_store.half())
+    updated_k = cache_k.scatter(1, this_indexes, k_store.half() if USE_FLOAT16_STATES else k_store.float())
+    updated_v = cache_v.scatter(1, this_indexes, v_store.half() if USE_FLOAT16_STATES else v_store.float())
     
     layer_state["cache_k"] = updated_k
     layer_state["cache_v"] = updated_v

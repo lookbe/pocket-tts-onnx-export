@@ -38,6 +38,11 @@ from pocket_tts.modules.transformer import StreamingMultiheadAttention
 from onnx_export.export_utils import get_state_structure, flatten_state
 
 # ==============================================================================
+# 0. CONFIGURATION
+# ==============================================================================
+USE_FLOAT16_STATES = True #Optimization: Use float16 for states to reduce memory bandwidth by 50%
+
+# ==============================================================================
 # 1. MONKEYPATCHES
 # ==============================================================================
 
@@ -47,8 +52,7 @@ from pocket_tts.modules.transformer import StreamingMultiheadAttention
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
-    # Optimization: Use float16 for states to reduce memory bandwidth by 50%
-    dtype = torch.float16
+    dtype = torch.float16 if USE_FLOAT16_STATES else torch.float32
     return dict(
         cache_k=torch.full(
             (batch_size, sequence_length, self.num_heads, self.dim_per_head),
@@ -85,8 +89,8 @@ def patched_append_and_get(self, k, v, state):
     # Optimization: Use scatter for O(1) updates instead of O(N) clones
     indices = (off + torch.arange(L, device=k.device, dtype=torch.long)).view(1, L, 1, 1).expand(B, L, H, D)
     
-    updated_k = cache_k.scatter(1, indices, k.half())
-    updated_v = cache_v.scatter(1, indices, v.half())
+    updated_k = cache_k.scatter(1, indices, k.half() if USE_FLOAT16_STATES else k.float())
+    updated_v = cache_v.scatter(1, indices, v.half() if USE_FLOAT16_STATES else v.float())
     state["cache_k"] = updated_k
     state["cache_v"] = updated_v
     

@@ -1,8 +1,12 @@
 import os
 import argparse
 import onnx
+import re
 from onnxruntime.quantization import quantize_dynamic, QuantType
 from pathlib import Path
+
+# Settings for selective quantization
+QUANTIZE_MIDDLE_LAYERS_ONLY = False # If True, only quantize middle 4 layers (1-4) of FlowLM
 
 MODELS_TO_QUANTIZE = [
     "flow_lm_main",
@@ -22,7 +26,7 @@ def quantize_file(input_path: Path, output_path: Path, model_name: str):
     # Selective node quantization logic
     nodes_to_quantize = []
     if model_name == "flow_lm_main":
-        print("  Applying selective node quantization (Transformer backbone)...")
+        print(f"  Applying selective node quantization (Transformer backbone, middle_only={QUANTIZE_MIDDLE_LAYERS_ONLY})...")
         model = onnx.load(str(input_path))
         for node in model.graph.node:
             if node.op_type in ["MatMul", "Gemm"]:
@@ -31,7 +35,15 @@ def quantize_file(input_path: Path, output_path: Path, model_name: str):
                 # Skip input_linear and attention score MatMuls (activation*activation)
                 if "/transformer/" in name:
                     if any(x in name for x in ["/in_proj/", "/out_proj/", "/linear1/", "/linear2/"]):
-                        nodes_to_quantize.append(name)
+                        if QUANTIZE_MIDDLE_LAYERS_ONLY:
+                            # Extract layer index from name like ".../layers.0/..."
+                            match = re.search(r"/layers\.(\d+)/", name)
+                            if match:
+                                layer_idx = int(match.group(1))
+                                if 1 <= layer_idx <= 4:
+                                    nodes_to_quantize.append(name)
+                        else:
+                            nodes_to_quantize.append(name)
         print(f"  Selected {len(nodes_to_quantize)} nodes for quantization.")
     
     temp_path = None
