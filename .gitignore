@@ -18,3 +18,4 @@ models/
 # Misc
 .DS_Store
 /models
+/models_low_mem

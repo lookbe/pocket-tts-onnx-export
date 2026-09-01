@@ -241,6 +241,7 @@ def main():
     parser.add_argument("--output_dir", "-o", type=str, default="onnx_models", help="Directory for output ONNX files")
     parser.add_argument("--weights_path", "-w", type=str, default="weights/tts_b6369a24.safetensors", help="Path to weights file used to load FlowLM")
     parser.add_argument("--config", "-c", type=str, default=None, help="Path to config YAML file")
+    parser.add_argument("--seq_len", type=int, default=1000, help="Static KV-cache sequence length baked into the exported graph")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -274,7 +275,7 @@ def main():
         print("Warning: flow_lm.bos_before_voice not found; skipping bos_before_voice.npy export.")
             
     # Init patched state
-    STATIC_SEQ_LEN = 1000
+    STATIC_SEQ_LEN = args.seq_len
     state = init_states(tts.flow_lm, batch_size=1, sequence_length=STATIC_SEQ_LEN)
     structure = get_state_structure(state)
     flat_state = flatten_state(state)

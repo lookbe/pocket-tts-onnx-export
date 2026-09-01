@@ -356,7 +356,7 @@ def patched_get_extra_padding(x, kernel_size, stride, padding_total=0):
 
 conv.get_extra_padding_for_conv1d = patched_get_extra_padding
 
-def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.safetensors", config_path=None):
+def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.safetensors", config_path=None, seq_len=1000):
     os.makedirs(output_dir, exist_ok=True)
 
     print(f"Loading model with config: {config_path or DEFAULT_LANGUAGE}...")
@@ -441,8 +441,9 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     print(f"Text Conditioner exported to {conditioner_onnx_path}")
     
     # Initialize state with static size sufficient for expected usage
-    # 1000 tokens covers ~40s audio or long text prompts
-    STATIC_SEQ_LEN = 1000
+    # (1000 tokens covers ~40s audio or long text prompts; caller may trim this, e.g. for
+    # a low-memory build -- see agents/low_mem.md)
+    STATIC_SEQ_LEN = seq_len
     
     flow_lm_onnx_path = None
     
@@ -498,7 +499,7 @@ def export_models(output_dir="onnx_models", weights_path="weights/tts_b6369a24.s
     
     return flow_lm_onnx_path, mimi_onnx_path, tts_model
 
-def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
+def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models", seq_len=1000):
     print("Verifying export...")
     
     encoder_path = os.path.join(output_dir, "mimi_encoder.onnx")
@@ -564,7 +565,7 @@ def verify_export(flow_lm_path, mimi_path, tts_model, output_dir="onnx_models"):
         # ---------------------------------------------------------
         ort_session_mimi = ort.InferenceSession(mimi_path)
         
-        mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=1000)
+        mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=seq_len)
         flat_mimi_state = flatten_state(mimi_state)
         
         latent = torch.randn(1, 1, tts_model.flow_lm.ldim)
@@ -622,10 +623,11 @@ def main():
     parser.add_argument("--output_dir", "-o", type=str, default="onnx_models", help="Directory for output ONNX files")
     parser.add_argument("--weights_path", "-w", type=str, default="weights/tts_b6369a24.safetensors", help="Path to weights file")
     parser.add_argument("--config", "-c", type=str, default=None, help="Path to config YAML file")
+    parser.add_argument("--seq_len", type=int, default=1000, help="Static KV-cache/conv-state sequence length baked into the exported Mimi graph")
     args = parser.parse_args()
-    
-    flow, mimi, model = export_models(output_dir=args.output_dir, weights_path=args.weights_path, config_path=args.config)
-    verify_export(flow, mimi, model, output_dir=args.output_dir)
+
+    flow, mimi, model = export_models(output_dir=args.output_dir, weights_path=args.weights_path, config_path=args.config, seq_len=args.seq_len)
+    verify_export(flow, mimi, model, output_dir=args.output_dir, seq_len=args.seq_len)
 
 if __name__ == "__main__":
     main()
