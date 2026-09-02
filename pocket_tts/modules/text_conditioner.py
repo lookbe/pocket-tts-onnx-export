@@ -4,7 +4,6 @@ import sentencepiece
 import torch
 from torch import nn
 
-from pocket_tts.conditioners.base import BaseConditioner, TokenizedText
 from pocket_tts.utils.utils import download_if_necessary
 
 logger = logging.getLogger(__name__)
@@ -31,8 +30,8 @@ class SentencePieceTokenizer:
             f"sentencepiece tokenizer has vocab size={self.sp.vocab_size()} but nbins={nbins} was specified"
         )
 
-    def __call__(self, text: str) -> TokenizedText:
-        return TokenizedText(torch.tensor(self.sp.encode(text, out_type=int))[None, :])
+    def __call__(self, text: str) -> torch.Tensor:
+        return torch.tensor(self.sp.encode(text, out_type=int))[None, :]
 
 
 DEFAULT_TOKENIZER_N_BINS = 4000
@@ -50,7 +49,7 @@ def get_default_tokenizer() -> SentencePieceTokenizer:
     return SentencePieceTokenizer(DEFAULT_TOKENIZER_N_BINS, DEFAULT_TOKENIZER_PATH)
 
 
-class LUTConditioner(BaseConditioner):
+class LUTConditioner(nn.Module):
     """Lookup table TextConditioner.
 
     Args:
@@ -62,15 +61,14 @@ class LUTConditioner(BaseConditioner):
     """
 
     def __init__(self, n_bins: int, tokenizer_path: str, dim: int, output_dim: int):
-        super().__init__(dim=dim, output_dim=output_dim)
+        super().__init__()
+        self.dim = dim
+        self.output_dim = output_dim
         self.tokenizer = SentencePieceTokenizer(n_bins, tokenizer_path)
         self.embed = nn.Embedding(n_bins + 1, self.dim)  # n_bins + 1 for padding.
 
-    def prepare(self, x: str) -> TokenizedText:
-        tokens = self.tokenizer(x)
-        tokens = tokens[0].to(self.embed.weight.device)
-        return TokenizedText(tokens)
+    def prepare(self, x: str) -> torch.Tensor:
+        return self.tokenizer(x).to(self.embed.weight.device)
 
-    def _get_condition(self, inputs: TokenizedText) -> torch.Tensor:
-        embeds = self.embed(inputs[0])
-        return embeds
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.embed(tokens)

@@ -29,18 +29,25 @@ def audio_read(filepath: str | Path) -> tuple[torch.Tensor, int]:
         with wave.open(str(filepath), "rb") as wav_file:
             sample_rate = wav_file.getframerate()
             n_channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            if sample_width != 2:
+                return _audio_read_with_soundfile(filepath)
             raw_data = wav_file.readframes(-1)
             samples = np.frombuffer(raw_data, dtype=np.int16).astype(np.float32) / 32768.0
             if n_channels > 1:
                 samples = samples.reshape(-1, n_channels).mean(axis=1)
             return torch.from_numpy(samples).unsqueeze(0), sample_rate
 
-    # For non-WAV formats, use soundfile (optional dependency)
+    return _audio_read_with_soundfile(filepath)
+
+
+def _audio_read_with_soundfile(filepath: Path) -> tuple[torch.Tensor, int]:
+    # For non-WAV and non-16-bit WAV formats, use soundfile (optional dependency)
     try:
         import soundfile as sf
     except ImportError as e:
         raise ImportError(
-            "soundfile is required to read non-WAV audio files. "
+            "soundfile is required to read non-WAV or non-16-bit WAV audio files. "
             "Install with: `pip install soundfile` or `uvx --with soundfile`"
         ) from e
 
@@ -60,16 +67,19 @@ class StreamingWAVWriter:
         self.sample_rate = sample_rate
         self.wave_writer = None
         self.first_chunk_buffer = []
+        self.is_seekable = _is_seekable(output_stream)
 
     def write_header(self, sample_rate: int):
         """Initialize WAV writer with header."""
         # For stdout streaming, we need to handle the unseekable stream case
         # The wave module supports unseekable streams since Python 3.4
-        self.wave_writer = wave.open(self.output_stream, "wb")
+        # Closed with the underlying stream by the caller's `with f:` block.
+        self.wave_writer = wave.open(self.output_stream, "wb")  # noqa: SIM115
         self.wave_writer.setnchannels(1)  # Mono
         self.wave_writer.setsampwidth(2)  # 16-bit
         self.wave_writer.setframerate(sample_rate)
-        self.wave_writer.setnframes(1_000_000_000)
+        if not self.is_seekable:
+            self.wave_writer.setnframes(1_000_000_000)
 
     def write_pcm_data(self, audio_chunk: torch.Tensor):
         """Write PCM data using wave module."""
@@ -108,13 +118,24 @@ class StreamingWAVWriter:
 
         if self.wave_writer:
             # do not update the header for unseekable streams
-            self.wave_writer._patchheader = lambda: None
+            if not self.is_seekable:
+                self.wave_writer._patchheader = lambda: None
             self.wave_writer.close()
 
 
 def is_file_like(obj):
     """Check if object has basic file-like methods."""
     return all(hasattr(obj, attr) for attr in ["write", "close"])
+
+
+def _is_seekable(obj) -> bool:
+    seekable = getattr(obj, "seekable", None)
+    if seekable is not None:
+        try:
+            return bool(seekable())
+        except OSError:
+            return False
+    return all(hasattr(obj, attr) for attr in ("seek", "tell"))
 
 
 def stream_audio_chunks(
@@ -128,7 +149,7 @@ def stream_audio_chunks(
     elif is_file_like(path):
         f = path
     else:
-        f = open(path, "wb")
+        f = open(path, "wb")  # noqa: SIM115  -- closed by the `with f:` below
 
     with f:
         if path is not None:

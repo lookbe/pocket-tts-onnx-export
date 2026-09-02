@@ -18,21 +18,28 @@ from onnx_export.export_utils import get_state_structure, flatten_state
 # ==============================================================================
 # MONKEYPATCHES for EXACT ONNX PARITY
 # ==============================================================================
-import pocket_tts.modules.transformer as transformer_module
-from pocket_tts.modules.transformer import StreamingMultiheadAttention
+# Must match the state contract (cache_k/cache_v/step) actually baked into the exported
+# flow_lm_main.onnx by scripts/export_flow_lm.py.
+import pocket_tts.modules.attention as attention_module
+from pocket_tts.modules.attention import StreamingMultiheadAttention, _build_attention_mask
 import torch.nn.functional as F
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
     dtype = self.in_proj.weight.dtype
     return dict(
-        cache=torch.full(
-            (2, batch_size, sequence_length, self.num_heads, self.dim_per_head),
-            float("NaN"),
+        cache_k=torch.full(
+            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
+            0.0,
             device=device,
             dtype=dtype,
         ),
-        current_end=torch.zeros(0, device=device, dtype=dtype),
+        cache_v=torch.full(
+            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
+            0.0,
+            device=device,
+            dtype=dtype,
+        ),
         step=torch.zeros(batch_size, dtype=torch.long, device=device),
     )
 
@@ -46,43 +53,58 @@ def patched_append_and_get(self, k, v, state):
         step = torch.zeros(k_attn.shape[0], device=k_attn.device, dtype=torch.long)
         return k_attn, v_attn, pos_k, step
 
-    cache = state["cache"]
+    cache_k = state["cache_k"]
+    cache_v = state["cache_v"]
     step = state["step"]
     off = step.view(-1)[0]
-    
-    new_cache = cache.clone()
-    new_cache[0, :, off : off + k.shape[1]] = k
-    new_cache[1, :, off : off + v.shape[1]] = v
-    state["cache"] = new_cache
-    
-    valid_len = off + k.shape[1]
-    k_attn = new_cache[0, :, :valid_len].permute(0, 2, 1, 3)
-    v_attn = new_cache[1, :, :valid_len].permute(0, 2, 1, 3)
-    
-    MAX_POS = 4096
-    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(k_attn.shape[0], -1)
+
+    B, L, H, D = k.shape
+    capacity = cache_k.shape[1]
+
+    # Ring buffer: wrap the absolute write offset into [0, capacity).
+    write_idx = (off + torch.arange(L, device=k.device, dtype=torch.long)) % capacity
+    indices = write_idx.view(1, L, 1, 1).expand(B, L, H, D)
+
+    updated_k = cache_k.scatter(1, indices, k.to(cache_k.dtype))
+    updated_v = cache_v.scatter(1, indices, v.to(cache_v.dtype))
+    state["cache_k"] = updated_k
+    state["cache_v"] = updated_v
+
+    # Absolute position of every cache slot (-1 for slots not yet written or already
+    # overwritten), mirroring pocket_tts's original Mimi ring-buffer cache.
+    cache_slots = torch.arange(capacity, device=k.device, dtype=torch.long)
+    last_written = off + L - 1
+    end_slot = last_written % capacity
+    delta = cache_slots - end_slot
+    positions = torch.where(delta <= 0, last_written + delta, last_written + delta - capacity)
+    invalid = cache_slots >= (off + L)
+    positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+
+    k_attn = updated_k.permute(0, 2, 1, 3)
+    v_attn = updated_v.permute(0, 2, 1, 3)
+    pos_k = positions.view(1, -1).expand(B, -1)
     return k_attn, v_attn, pos_k, step
 
-def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
+def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None, attn_mask=None):
     state = None if model_state is None else self.get_state(model_state)
     projected = self.in_proj(query)
     b, t, _ = projected.shape
     d = self.dim_per_head
     packed = projected.view(b, t, 3, self.num_heads, d)
     q, k, v = torch.unbind(packed, dim=2)
-    
+
     if state is None:
         rope_offset = torch.zeros((), dtype=torch.long, device=q.device)
     else:
         rope_offset = state["step"].view(-1)[0]
-        
+
     q, k = self.rope(q, k, offset=rope_offset)
     q = q.transpose(1, 2)
     k_attn, v_attn, pos_k, step = self._cache_backend.append_and_get(k, v, state)
-    MAX_POS = 4096
-    pos_q = step.view(-1, 1) + torch.arange(MAX_POS, device=q.device, dtype=torch.long)[:t].unsqueeze(0)
-    from pocket_tts.modules.transformer import _build_attention_mask
-    attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
+    if attn_mask is None:
+        off = step.view(-1)[0]
+        pos_q = off + torch.arange(t, device=q.device, dtype=torch.long).view(1, -1)
+        attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
     x = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask, dropout_p=0.0)
     x = x.transpose(1, 2)
     b, t, h, d = x.shape
@@ -90,7 +112,7 @@ def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
     x = self.out_proj(x)
     return x
 
-transformer_module._LinearKVCacheBackend.append_and_get = patched_append_and_get
+attention_module._LinearKVCacheBackend.append_and_get = patched_append_and_get
 StreamingMultiheadAttention.init_state = patched_init_state
 StreamingMultiheadAttention.increment_step = patched_increment_step
 StreamingMultiheadAttention.forward = patched_sma_forward
@@ -197,7 +219,7 @@ def main():
     print("\n--- PHASE 1: Voice Conditioning ---")
     with torch.no_grad():
         encoded = tts_model.mimi.encode_to_latent(audio_tensor)
-        latents = encoded.transpose(-1, -2).to(torch.float32)
+        latents = encoded.to(torch.float32)  # already [B, T, 32] (channel-last)
         pt_voice_latents = torch.nn.functional.linear(latents, tts_model.flow_lm.speaker_proj_weight)
         
         # In the new version, the wrapper handles BOS automatically
@@ -239,9 +261,8 @@ def main():
     onnx_state = {f"state_{i}": onnx_outputs[i+2] for i in range(len(onnx_outputs) - 2)}
 
     print("\n--- PHASE 2: Text Conditioning ---")
-    from pocket_tts.conditioners.base import TokenizedText
     tokens = tts_model.flow_lm.conditioner.tokenizer(args.text)
-    token_ids = tokens.tokens
+    token_ids = tokens
     
     with torch.no_grad():
         pt_text_emb = tts_model.flow_lm.conditioner(tokens)

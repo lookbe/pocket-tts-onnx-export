@@ -71,10 +71,9 @@ def compare_encoder(ort_session, pt_wrapper, tts_model, audio_path=None):
         test_audio = torch.randn(1, 1, 24000)
     
     # Ground truth: what the PyTorch reference model actually does
-    # (tts_model._encode_audio → encode_to_latent + transpose + F.linear, NO normalization)
+    # (tts_model._encode_audio → encode_to_latent + F.linear, NO normalization)
     with torch.no_grad():
-        encoded = tts_model.mimi.encode_to_latent(test_audio)
-        latents = encoded.transpose(-1, -2)
+        latents = tts_model.mimi.encode_to_latent(test_audio)  # already [B, T, 32]
         import torch.nn.functional as F_test
         pt_out = F_test.linear(latents, tts_model.flow_lm.speaker_proj_weight).numpy()
     
@@ -173,9 +172,9 @@ def compare_flow_lm_flow(ort_session, pt_wrapper, tts_model):
 
 def compare_mimi_decoder(ort_session, pt_wrapper, tts_model):
     print("\n--- Comparing Mimi Decoder ---")
-    mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=1000)
+    mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=MIMI_ATTN_CACHE_CAPACITY)
     flat_mimi_state = flatten_state(mimi_state)
-    
+
     print(f"PyTorch Mimi States: {len(flat_mimi_state)}")
     print(f"ONNX Mimi Session Inputs: {len(ort_session.get_inputs()) - 1}") # -1 for 'latent'
     
@@ -221,8 +220,14 @@ def compare_mimi_decoder(ort_session, pt_wrapper, tts_model):
 # ==============================================================================
 # MONKEYPATCHES for EXACT ONNX PARITY
 # ==============================================================================
-import pocket_tts.modules.transformer as transformer_module
-from pocket_tts.modules.transformer import StreamingMultiheadAttention
+# FlowLM and Mimi share one StreamingMultiheadAttention class upstream, so this single
+# ring-buffer-capable patch must cover both: FlowLM's cache (capacity=1000 below) never
+# wraps in practice, while Mimi's small fixed capacity (MIMI_ATTN_CACHE_CAPACITY, matching
+# export_mimi_and_conditioner.py) relies on the wrap for unbounded-length streaming decode.
+MIMI_ATTN_CACHE_CAPACITY = 250
+
+import pocket_tts.modules.attention as attention_module
+from pocket_tts.modules.attention import StreamingMultiheadAttention, _build_attention_mask
 import torch.nn.functional as F
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
@@ -259,43 +264,54 @@ def patched_append_and_get(self, k, v, state):
     cache_v = state["cache_v"]
     step = state["step"]
     off = step.view(-1)[0]
-    
+
     B, L, H, D = k.shape
-    indices = (off + torch.arange(L, device=k.device, dtype=torch.long)).view(1, L, 1, 1).expand(B, L, H, D)
-    
+    capacity = cache_k.shape[1]
+
+    # Ring buffer: wrap the absolute write offset into [0, capacity).
+    write_idx = (off + torch.arange(L, device=k.device, dtype=torch.long)) % capacity
+    indices = write_idx.view(1, L, 1, 1).expand(B, L, H, D)
+
     updated_k = cache_k.scatter(1, indices, k.half())
     updated_v = cache_v.scatter(1, indices, v.half())
     state["cache_k"] = updated_k
     state["cache_v"] = updated_v
-    
-    valid_len = off + L
-    k_attn = updated_k[:, :valid_len].permute(0, 2, 1, 3).float()
-    v_attn = updated_v[:, :valid_len].permute(0, 2, 1, 3).float()
-    
-    MAX_POS = 4096
-    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(B, -1)
+
+    # Absolute position of every cache slot (-1 for slots not yet written or already
+    # overwritten), mirroring pocket_tts's original Mimi ring-buffer cache.
+    cache_slots = torch.arange(capacity, device=k.device, dtype=torch.long)
+    last_written = off + L - 1
+    end_slot = last_written % capacity
+    delta = cache_slots - end_slot
+    positions = torch.where(delta <= 0, last_written + delta, last_written + delta - capacity)
+    invalid = cache_slots >= (off + L)
+    positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+
+    k_attn = updated_k.permute(0, 2, 1, 3).float()
+    v_attn = updated_v.permute(0, 2, 1, 3).float()
+    pos_k = positions.view(1, -1).expand(B, -1)
     return k_attn, v_attn, pos_k, step
 
-def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
+def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None, attn_mask=None):
     state = None if model_state is None else self.get_state(model_state)
     projected = self.in_proj(query)
     b, t, _ = projected.shape
     d = self.dim_per_head
     packed = projected.view(b, t, 3, self.num_heads, d)
     q, k, v = torch.unbind(packed, dim=2)
-    
+
     if state is None:
         rope_offset = torch.zeros((), dtype=torch.long, device=q.device)
     else:
         rope_offset = state["step"].view(-1)[0]
-        
+
     q, k = self.rope(q, k, offset=rope_offset)
     q = q.transpose(1, 2)
     k_attn, v_attn, pos_k, step = self._cache_backend.append_and_get(k, v, state)
-    MAX_POS = 4096
-    pos_q = step.view(-1, 1) + torch.arange(MAX_POS, device=q.device, dtype=torch.long)[:t].unsqueeze(0)
-    from pocket_tts.modules.transformer import _build_attention_mask
-    attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
+    if attn_mask is None:
+        off = step.view(-1)[0]
+        pos_q = off + torch.arange(t, device=q.device, dtype=torch.long).view(1, -1)
+        attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
     x = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask, dropout_p=0.0)
     x = x.transpose(1, 2)
     b, t, h, d = x.shape
@@ -303,7 +319,7 @@ def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
     x = self.out_proj(x)
     return x
 
-transformer_module._LinearKVCacheBackend.append_and_get = patched_append_and_get
+attention_module._LinearKVCacheBackend.append_and_get = patched_append_and_get
 StreamingMultiheadAttention.init_state = patched_init_state
 StreamingMultiheadAttention.increment_step = patched_increment_step
 StreamingMultiheadAttention.forward = patched_sma_forward
@@ -381,7 +397,7 @@ def main():
     if os.path.exists(mimi_decoder_path):
         try:
             ort_mimi = ort.InferenceSession(mimi_decoder_path)
-            mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=1000)
+            mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=MIMI_ATTN_CACHE_CAPACITY)
             pt_mimi = MimiWrapper(tts_model.mimi, get_state_structure(mimi_state), tts_model.flow_lm.emb_std, tts_model.flow_lm.emb_mean)
             compare_mimi_decoder(ort_mimi, pt_mimi, tts_model)
         except Exception as e:

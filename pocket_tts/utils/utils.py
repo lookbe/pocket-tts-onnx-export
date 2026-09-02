@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import torch
@@ -34,11 +35,16 @@ _ORIGINS_OF_PREDEFINED_VOICES = {
     "peter_yearsley": "hf://kyutai/tts-voices/voice-zero/peter_yearsley.wav",
     "stuart_bell": "hf://kyutai/tts-voices/voice-zero/stuart_bell.wav",
     "caro_davy": "hf://kyutai/tts-voices/voice-zero/caro_davy.wav",
+    "giovanni": "hf://kyutai/pocket-tts/common_voice_it_36520747-enhanced-v2.mp3@64ab7d24c479d736a83b8cc666c4a776fca30fda",
+    "lola": "hf://kyutai/pocket-tts/common_voice_es_19762977-enhanced-v2.mp3@64ab7d24c479d736a83b8cc666c4a776fca30fda",
+    "juergen": "hf://kyutai/pocket-tts/de-DE-juergen.mp3@64ab7d24c479d736a83b8cc666c4a776fca30fda",
+    "rafael": "hf://kyutai/pocket-tts/g-Vi8PgmSY0-enhanced-v2.wav@64ab7d24c479d736a83b8cc666c4a776fca30fda",
+    "estelle": "hf://kyutai/tts-voices/unmute-prod-website/developpeuse-3.wav@1fc7395b7e012e2bbebfca14b942a4ef62ccc899",
 }
 
 
 def get_predefined_voice(language: str, name: str) -> str:
-    return f"hf://kyutai/pocket-tts/languages/{language}/embeddings/{name}.safetensors@25443bdc51dd9d08cca86e0f080d25e8a05c39b3"
+    return f"hf://kyutai/pocket-tts-without-voice-cloning/languages/{language}/embeddings/{name}.safetensors@e81d79e8194ad4c7ce879c87a4258ef20cbf2487"
 
 
 def make_cache_directory() -> Path:
@@ -90,9 +96,8 @@ class display_execution_time:
 def download_if_necessary(file_path: str) -> Path:
     if file_path.startswith("http://") or file_path.startswith("https://"):
         cache_dir = make_cache_directory()
-        cached_file = cache_dir / (
-            hashlib.sha256(file_path.encode()).hexdigest() + "." + file_path.split(".")[-1]
-        )
+        suffix = Path(urlparse(file_path).path).suffix
+        cached_file = cache_dir / (hashlib.sha256(file_path.encode()).hexdigest() + suffix)
         if not cached_file.exists():
             response = requests.get(file_path)
             response.raise_for_status()

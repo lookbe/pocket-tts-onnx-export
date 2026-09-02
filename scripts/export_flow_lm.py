@@ -34,7 +34,7 @@ import numpy as np
 from pocket_tts.models.tts_model import TTSModel
 from pocket_tts.default_parameters import DEFAULT_LANGUAGE
 from pocket_tts.modules.stateful_module import init_states, StatefulModule
-from pocket_tts.modules.transformer import StreamingMultiheadAttention
+from pocket_tts.modules.attention import StreamingMultiheadAttention
 from onnx_export.export_utils import get_state_structure, flatten_state
 
 # ==============================================================================
@@ -47,8 +47,8 @@ USE_FLOAT16_STATES = True #Optimization: Use float16 for states to reduce memory
 # ==============================================================================
 
 # Monkeypatch StreamingMultiheadAttention and its backend for ONNX tracing
-import pocket_tts.modules.transformer as transformer_module
-from pocket_tts.modules.transformer import StreamingMultiheadAttention
+import pocket_tts.modules.attention as attention_module
+from pocket_tts.modules.attention import StreamingMultiheadAttention, _build_attention_mask
 
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
@@ -83,46 +83,59 @@ def patched_append_and_get(self, k, v, state):
     cache_v = state["cache_v"]
     step = state["step"]
     off = step.view(-1)[0]
-    
+
     B, L, H, D = k.shape
-    
-    # Optimization: Use scatter for O(1) updates instead of O(N) clones
-    indices = (off + torch.arange(L, device=k.device, dtype=torch.long)).view(1, L, 1, 1).expand(B, L, H, D)
-    
+    capacity = cache_k.shape[1]
+
+    # Ring buffer: wrap the absolute write offset into [0, capacity). A capacity that's
+    # never reached (FlowLM's here, sized to the whole utterance budget) behaves exactly
+    # like a plain growing cache; only Mimi's export relies on the wrap (see
+    # export_mimi_and_conditioner.py) to support streaming decode of unbounded length
+    # with a small fixed-size cache.
+    write_idx = (off + torch.arange(L, device=k.device, dtype=torch.long)) % capacity
+    indices = write_idx.view(1, L, 1, 1).expand(B, L, H, D)
+
     updated_k = cache_k.scatter(1, indices, k.half() if USE_FLOAT16_STATES else k.float())
     updated_v = cache_v.scatter(1, indices, v.half() if USE_FLOAT16_STATES else v.float())
     state["cache_k"] = updated_k
     state["cache_v"] = updated_v
-    
-    valid_len = off + L
+
+    # Absolute position of every cache slot (-1 for slots not yet written or already
+    # overwritten), mirroring pocket_tts's original Mimi ring-buffer cache.
+    cache_slots = torch.arange(capacity, device=k.device, dtype=torch.long)
+    last_written = off + L - 1
+    end_slot = last_written % capacity
+    delta = cache_slots - end_slot
+    positions = torch.where(delta <= 0, last_written + delta, last_written + delta - capacity)
+    invalid = cache_slots >= (off + L)
+    positions = torch.where(invalid, torch.full_like(positions, -1), positions)
+
     # Cast back to float for attention (optimized for ORT CPU kernels)
-    k_attn = updated_k[:, :valid_len].permute(0, 2, 1, 3).float()
-    v_attn = updated_v[:, :valid_len].permute(0, 2, 1, 3).float()
-    
-    MAX_POS = 4096
-    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(B, -1)
+    k_attn = updated_k.permute(0, 2, 1, 3).float()
+    v_attn = updated_v.permute(0, 2, 1, 3).float()
+    pos_k = positions.view(1, -1).expand(B, -1)
     return k_attn, v_attn, pos_k, step
 
-def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
+def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None, attn_mask=None):
     state = None if model_state is None else self.get_state(model_state)
     projected = self.in_proj(query)
     b, t, _ = projected.shape
     d = self.dim_per_head
     packed = projected.view(b, t, 3, self.num_heads, d)
     q, k, v = torch.unbind(packed, dim=2)
-    
+
     if state is None:
         rope_offset = torch.zeros((), dtype=torch.long, device=q.device)
     else:
         rope_offset = state["step"].view(-1)[0]
-        
+
     q, k = self.rope(q, k, offset=rope_offset)
     q = q.transpose(1, 2)
     k_attn, v_attn, pos_k, step = self._cache_backend.append_and_get(k, v, state)
-    MAX_POS = 4096
-    pos_q = step.view(-1, 1) + torch.arange(MAX_POS, device=q.device, dtype=torch.long)[:t].unsqueeze(0)
-    from pocket_tts.modules.transformer import _build_attention_mask
-    attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
+    if attn_mask is None:
+        off = step.view(-1)[0]
+        pos_q = off + torch.arange(t, device=q.device, dtype=torch.long).view(1, -1)
+        attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
     x = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask, dropout_p=0.0)
     x = x.transpose(1, 2)
     b, t, h, d = x.shape
@@ -131,7 +144,7 @@ def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None):
     return x
 
 # Apply patches
-transformer_module._LinearKVCacheBackend.append_and_get = patched_append_and_get
+attention_module._LinearKVCacheBackend.append_and_get = patched_append_and_get
 StreamingMultiheadAttention.init_state = patched_init_state
 StreamingMultiheadAttention.increment_step = patched_increment_step
 StreamingMultiheadAttention.forward = patched_sma_forward

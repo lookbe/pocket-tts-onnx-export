@@ -2,6 +2,7 @@ torch
 onnx
 onnxruntime
 huggingface_hub
+requests
 beartype
 scipy
 soundfile

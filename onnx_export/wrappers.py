@@ -131,18 +131,14 @@ class MimiWrapper(nn.Module):
         # Un-normalize latent: scale and shift back
         # latent is (B, T, 32), emb_std/mean are (32)
         mimi_decoding_input = latent * self.emb_std + self.emb_mean
-        
-        # Transpose: [B, T, D] -> [B, D, T]
-        transposed = mimi_decoding_input.transpose(-1, -2)
-        
-        # Project: [B, dim, T]
-        quantized = self.mimi.quantizer(transposed)
-        
+
         # Unflatten state
         model_state, _ = unflatten_state(flat_state, self.state_structure)
-        
-        # Decode
-        audio_frame = self.mimi.decode_from_latent(quantized, model_state)
+
+        # decode_from_latent now takes the [B, T, 32] latent directly and applies the
+        # transpose + quantizer projection internally (it used to expect the caller to
+        # do both first).
+        audio_frame = self.mimi.decode_from_latent(mimi_decoding_input, model_state)
 
         if torch.jit.is_tracing():
             from torch.onnx import operators
@@ -184,10 +180,9 @@ class MimiEncoderWrapper(nn.Module):
 
     def forward(self, audio):
         # audio: [B, C, T] -> latent: [B, T', 32]
-        encoded = self.mimi.encode_to_latent(audio)
-        # encoded is [B, 32, T'], we need [B, T', 32]
-        latents = encoded.transpose(-1, -2)
-        
+        # encode_to_latent already returns [B, T', 32] (channel-last) directly.
+        latents = self.mimi.encode_to_latent(audio)
+
         # NO normalization here. The PyTorch reference (_encode_audio in tts_model.py)
         # projects raw 32-dim latents directly: F.linear(latents, speaker_proj_weight)
         # emb_mean/emb_std are only used on the DECODER side to un-normalize.
@@ -208,5 +203,4 @@ class TextConditionerWrapper(nn.Module):
 
     def forward(self, token_ids):
         # token_ids: [B, T] -> embeddings: [B, T, D]
-        from pocket_tts.conditioners.base import TokenizedText
-        return self.conditioner(TokenizedText(token_ids))
+        return self.conditioner(token_ids)

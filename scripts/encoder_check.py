@@ -12,7 +12,7 @@ from pathlib import Path
 # Pocket TTS imports
 from pocket_tts.models.mimi import MimiModel
 from pocket_tts.modules.seanet import SEANetEncoder, SEANetDecoder
-from pocket_tts.modules import mimi_transformer
+from pocket_tts.modules import transformer as mimi_transformer
 from pocket_tts.modules.dummy_quantizer import DummyQuantizer
 from pocket_tts.utils.config import load_config
 from pocket_tts.utils.weights_loading import get_mimi_state_dict
@@ -87,8 +87,7 @@ def compare_encoder():
     
     print("Running PyTorch reference...")
     with torch.no_grad():
-        encoded = mimi.encode_to_latent(audio_pt)
-        latents = encoded.transpose(-1, -2) # [B, T, 32]
+        latents = mimi.encode_to_latent(audio_pt)  # already [B, T, 32]
         if speaker_proj_weight is not None:
             pt_out = F.linear(latents, speaker_proj_weight)
         else:
