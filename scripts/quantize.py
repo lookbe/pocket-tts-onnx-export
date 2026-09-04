@@ -12,6 +12,7 @@ MODELS_TO_QUANTIZE = [
     "flow_lm_main",
     "flow_lm_flow",
     "mimi_decoder",
+    "mimi_encoder",
 ]
 
 
