@@ -326,6 +326,7 @@ def export_language_low_mem(lang_dir: Path, weights_path: Path, config_path: Pat
         str(SCRIPTS_DIR / "quantize.py"),
         "--input_dir", str(low_mem_lang_dir),
         "--output_dir", str(low_mem_lang_dir),
+        "--separate_data",
     ]
     if not run_cmd(quant_cmd, env):
         print(f"FAILED: Quantization Failed for {lang_name} (low-mem)")

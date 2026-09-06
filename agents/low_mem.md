@@ -5,7 +5,7 @@
 | Directory | Contents | Purpose |
 | :--- | :--- | :--- |
 | `models/<lang>/` | fp32, then `*_int8.onnx`, then `*_int4.onnx` (single embedded file, 1000-token state) | Default / desktop / higher-RAM targets |
-| `models_low_mem/<lang>/` | fp32 (400-token state) + `*_int8.onnx` + `*_int4.onnx` + `*_int4.onnx.data` (external/separated data) | Low-memory targets (e.g. iOS extensions, older/low-RAM devices) |
+| `models_low_mem/<lang>/` | fp32 (400-token state) + `*_int8.onnx`/`.onnx.data` + `*_int4.onnx`/`.onnx.data` (all separated) | Low-memory targets (e.g. iOS extensions, older/low-RAM devices) |
 
 The low-mem variant is exactly **three changes combined**, and they only pay off together:
 
