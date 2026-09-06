@@ -9,6 +9,7 @@ from pathlib import Path
 QUANTIZE_MIDDLE_LAYERS_ONLY = False # If True, only quantize middle 4 layers (1-4) of FlowLM
 
 MODELS_TO_QUANTIZE = [
+    "text_conditioner",
     "flow_lm_main",
     "flow_lm_flow",
     "mimi_decoder",
@@ -26,7 +27,12 @@ def quantize_file(input_path: Path, output_path: Path, model_name: str):
     
     # Selective node quantization logic
     nodes_to_quantize = []
-    if model_name == "flow_lm_main":
+    op_types_to_quantize = ["MatMul", "Gemm"]
+    if model_name == "text_conditioner":
+        # text_conditioner is a single embedding lookup (Gather), not MatMul/Gemm.
+        op_types_to_quantize = ["Gather"]
+        print("  Quantizing embedding Gather op...")
+    elif model_name == "flow_lm_main":
         print(f"  Applying selective node quantization (Transformer backbone, middle_only={QUANTIZE_MIDDLE_LAYERS_ONLY})...")
         model = onnx.load(str(input_path))
         for node in model.graph.node:
@@ -62,7 +68,7 @@ def quantize_file(input_path: Path, output_path: Path, model_name: str):
             "model_input": str(temp_path),
             "model_output": str(output_path),
             "weight_type": QuantType.QInt8,
-            "op_types_to_quantize": ["MatMul", "Gemm"],
+            "op_types_to_quantize": op_types_to_quantize,
             "per_channel": True,
             "extra_options": {"ForceQuantizeNoType": True, "DefaultTensorType": 1},
         }
