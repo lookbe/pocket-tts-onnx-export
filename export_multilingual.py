@@ -240,7 +240,7 @@ def export_language(lang_dir: Path):
         print(f"FAILED: Quantization Failed for {lang_name}")
         return False
 
-    # 4. Quantize to INT4 (single embedded .onnx per model; mimi_encoder stays fp32)
+    # 4. Quantize to INT4 (single embedded .onnx per model)
     print(f"\n[4/4] Quantizing ONNX models to INT4 for {lang_name}...")
     quant_int4_cmd = [
         sys.executable,

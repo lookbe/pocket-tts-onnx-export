@@ -15,23 +15,24 @@ from onnx_export.export_utils import convert_gemm_to_matmul_add, cast_weights_to
 # `--separate_data` controls only the on-disk container (single embedded .onnx vs.
 # .onnx + external .onnx.data); the quantization itself is identical either way.
 #
-# mimi_encoder is intentionally NOT in this list: it stays fp32/unquantized (used only for
-# voice cloning, and small/infrequent enough that int4-ing it isn't worth the quality risk).
-#
 # Caveats (onnxruntime's MatMulNBitsQuantizer only understands MatMul and Gather):
 #   - text_conditioner is a single Gather (embedding) op -> quantized via the Gather path.
 #   - flow_lm_flow is exported almost entirely as Gemm nodes (torch.onnx's legacy exporter
 #     turns nn.Linear into Gemm). Gemm is NOT quantized by MatMulNBitsQuantizer, so we first
 #     rewrite Gemm(A, W, bias) -> MatMul(A, W^T) + Add(bias), then quantize the MatMuls.
 #   - flow_lm_main is ~100% MatMul already, quantized directly.
-#   - mimi_decoder is a SEANet conv stack: its MatMul portion (~61% of its weight bytes) gets
-#     int4 quantized directly. Its Conv/ConvTranspose weights (~39%) have no weight-only int4
-#     path in onnxruntime (MatMulNBitsQuantizer only supports MatMul/Gather), so instead we
-#     store those weights as fp16-on-disk with a Cast(fp16->fp32) feeding each Conv -- every op
-#     still computes in fp32 (no fp16-kernel/type-propagation risk), only the stored weight
-#     bytes are halved. Numerically this is a no-op beyond fp16 rounding (cosine sim to the
-#     un-cast int4 model measured at 0.9999999).
-MODELS = ["text_conditioner", "flow_lm_flow", "flow_lm_main", "mimi_decoder"]
+#   - mimi_decoder and mimi_encoder are SEANet conv stacks (+ a transformer): their MatMul
+#     portion (~61% of decoder weight bytes, ~65% of encoder weight bytes) gets int4 quantized
+#     directly. Their Conv/ConvTranspose weights (the rest) have no weight-only int4 path in
+#     onnxruntime (MatMulNBitsQuantizer only supports MatMul/Gather), so instead we store those
+#     weights as fp16-on-disk with a Cast(fp16->fp32) feeding each Conv -- every op still
+#     computes in fp32 (no fp16-kernel/type-propagation risk), only the stored weight bytes are
+#     halved. Numerically this is a no-op beyond fp16 rounding (cosine sim to the un-cast int4
+#     decoder model measured at 0.9999999).
+#
+#     mimi_encoder is used for voice cloning, which is infrequent, so quantization quality risk
+#     matters less here than for the always-on decoder/flow-lm path.
+MODELS = ["text_conditioner", "flow_lm_flow", "flow_lm_main", "mimi_decoder", "mimi_encoder"]
 
 
 def quantize_int4(model, op_types_to_quantize, nodes_to_include=None, block_size=128):
@@ -92,7 +93,7 @@ def main():
             quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
         elif model_name == "flow_lm_main":
             quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
-        elif model_name == "mimi_decoder":
+        elif model_name in ("mimi_decoder", "mimi_encoder"):
             quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
             n_cast = cast_weights_to_float16(quantized, op_types=("Conv", "ConvTranspose"))
             print(f"  Cast {n_cast} Conv/ConvTranspose weight/bias tensors to fp16 (compute stays fp32).")
