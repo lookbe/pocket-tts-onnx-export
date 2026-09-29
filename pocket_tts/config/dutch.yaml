@@ -1,8 +1,6 @@
-weights_path: hf://lookbe/pocket-tts-6l/languages/french/model.safetensors
-weights_path_without_voice_cloning: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/french/model.safetensors
+weights_path: hf://lookbe/pocket-tts-6l/languages/dutch/model.safetensors
+weights_path_without_voice_cloning: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/dutch/model.safetensors
 
-remove_semicolons: true
-# Replace characters that are absent from the training data.
 replace_characters:
   '"': ''
   '“': ''
@@ -10,9 +8,8 @@ replace_characters:
   '„': ''
   '«': ''
   '»': ''
-  '’': "'"
-  '‘': "'"
-  ':': ','
+  '’': ''''
+  '‘': ''''
   '(': ''
   ')': ''
   '[': ''
@@ -34,7 +31,7 @@ flow_lm:
     dim: 1024
     n_bins: 4000
     tokenizer: tokenizers
-    tokenizer_path: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/french/tokenizer.model
+    tokenizer_path: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/dutch/tokenizer.model
   #weights_path: partial.safetensors
 
 mimi:

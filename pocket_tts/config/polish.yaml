@@ -1,23 +1,5 @@
-weights_path: hf://lookbe/pocket-tts-6l/languages/french/model.safetensors
-weights_path_without_voice_cloning: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/french/model.safetensors
-
-remove_semicolons: true
-# Replace characters that are absent from the training data.
-replace_characters:
-  '"': ''
-  '“': ''
-  '”': ''
-  '„': ''
-  '«': ''
-  '»': ''
-  '’': "'"
-  '‘': "'"
-  ':': ','
-  '(': ''
-  ')': ''
-  '[': ''
-  ']': ''
-
+weights_path: hf://shefowl/pocket-tts-polish-6l/model.safetensors@cd9047ee2fc9d1eb40ed38673d8b220485713863
+default_temperature: 0.3
 flow_lm:
   insert_bos_before_voice: true
   dtype: float32
@@ -33,10 +15,8 @@ flow_lm:
   lookup_table:
     dim: 1024
     n_bins: 4000
-    tokenizer: tokenizers
-    tokenizer_path: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/french/tokenizer.model
-  #weights_path: partial.safetensors
-
+    tokenizer: sentencepiece
+    tokenizer_path: hf://shefowl/pocket-tts-polish-6l/pl_bpe4000.model@cd9047ee2fc9d1eb40ed38673d8b220485713863
 mimi:
   dtype: float32
   sample_rate: 24000
@@ -72,4 +52,3 @@ mimi:
   quantizer:
     dimension: 32
     output_dimension: 512
-  #weights_path: codec.safetensors

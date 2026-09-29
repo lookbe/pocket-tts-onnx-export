@@ -1,8 +1,21 @@
-# sig: 8bcc8b3b.yaml
+weights_path: hf://lookbe/pocket-tts-6l/languages/spanish/model.safetensors
+weights_path_without_voice_cloning: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/spanish/model.safetensors
 
-weights_path: hf://kyutai/pocket-tts/languages/spanish/model.safetensors@7272245edd8f2bb47eec81cfb9cae6f2d1d91094
-#weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/languages/spanish/model.safetensors@7272245edd8f2bb47eec81cfb9cae6f2d1d91094
-
+replace_characters:
+  '"': ''
+  '“': ''
+  '”': ''
+  '„': ''
+  '«': ''
+  '»': ''
+  '’': ''''
+  '‘': ''''
+  '(': ''
+  ')': ''
+  '[': ''
+  ']': ''
+  '¡': ''
+  '¿': ''
 
 flow_lm:
   insert_bos_before_voice: true
@@ -19,9 +32,9 @@ flow_lm:
   lookup_table:
     dim: 1024
     n_bins: 4000
-    tokenizer: sentencepiece
-    tokenizer_path: hf://kyutai/pocket-tts/languages/spanish/tokenizer.model@7272245edd8f2bb47eec81cfb9cae6f2d1d91094
-  #weights_path: final.safetensors
+    tokenizer: tokenizers
+    tokenizer_path: hf://lookbe/pocket-tts-6l-without-voice-cloning/languages/spanish/tokenizer.model
+  #weights_path: partial.safetensors
 
 mimi:
   dtype: float32
