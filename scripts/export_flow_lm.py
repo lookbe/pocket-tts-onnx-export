@@ -85,14 +85,13 @@ def patched_append_and_get(self, k, v, state):
     off = step.view(-1)[0]
 
     B, L, H, D = k.shape
-    capacity = cache_k.shape[1]
 
-    # Ring buffer: wrap the absolute write offset into [0, capacity). A capacity that's
-    # never reached (FlowLM's here, sized to the whole utterance budget) behaves exactly
-    # like a plain growing cache; only Mimi's export relies on the wrap (see
-    # export_mimi_and_conditioner.py) to support streaming decode of unbounded length
-    # with a small fixed-size cache.
-    write_idx = (off + torch.arange(L, device=k.device, dtype=torch.long)) % capacity
+    # FlowLM's cache is linear (capacity covers the whole utterance budget and is never
+    # wrapped; only Mimi's export needs a ring buffer, see export_mimi_and_conditioner.py).
+    # Write at the absolute offset and attend over ONLY the filled prefix [0, off + L):
+    # attending over the full static capacity made every step cost O(capacity) instead of
+    # O(tokens so far) (Transpose/Cast/Mul/MatMul over [1, 1000, 16, 64] x 6 layers).
+    write_idx = off + torch.arange(L, device=k.device, dtype=torch.long)
     indices = write_idx.view(1, L, 1, 1).expand(B, L, H, D)
 
     updated_k = cache_k.scatter(1, indices, k.half() if USE_FLOAT16_STATES else k.float())
@@ -100,20 +99,13 @@ def patched_append_and_get(self, k, v, state):
     state["cache_k"] = updated_k
     state["cache_v"] = updated_v
 
-    # Absolute position of every cache slot (-1 for slots not yet written or already
-    # overwritten), mirroring pocket_tts's original Mimi ring-buffer cache.
-    cache_slots = torch.arange(capacity, device=k.device, dtype=torch.long)
-    last_written = off + L - 1
-    end_slot = last_written % capacity
-    delta = cache_slots - end_slot
-    positions = torch.where(delta <= 0, last_written + delta, last_written + delta - capacity)
-    invalid = cache_slots >= (off + L)
-    positions = torch.where(invalid, torch.full_like(positions, -1), positions)
-
+    valid_len = off + L
     # Cast back to float for attention (optimized for ORT CPU kernels)
-    k_attn = updated_k.permute(0, 2, 1, 3).float()
-    v_attn = updated_v.permute(0, 2, 1, 3).float()
-    pos_k = positions.view(1, -1).expand(B, -1)
+    k_attn = updated_k[:, :valid_len].permute(0, 2, 1, 3).float()
+    v_attn = updated_v[:, :valid_len].permute(0, 2, 1, 3).float()
+
+    MAX_POS = 4096
+    pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(B, -1)
     return k_attn, v_attn, pos_k, step
 
 def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None, attn_mask=None):
@@ -133,8 +125,8 @@ def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None, att
     q = q.transpose(1, 2)
     k_attn, v_attn, pos_k, step = self._cache_backend.append_and_get(k, v, state)
     if attn_mask is None:
-        off = step.view(-1)[0]
-        pos_q = off + torch.arange(t, device=q.device, dtype=torch.long).view(1, -1)
+        MAX_POS = 4096
+        pos_q = step.view(-1, 1) + torch.arange(MAX_POS, device=q.device, dtype=torch.long)[:t].unsqueeze(0)
         attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
     x = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask, dropout_p=0.0)
     x = x.transpose(1, 2)
