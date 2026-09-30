@@ -18,6 +18,9 @@ def install_check():
         print("❌ huggingface_hub is missing. Please run: pip install -r requirements.txt")
         sys.exit(1)
 
+# Set from --legacy_kv_cache: flow_lm_main defaults to the KV-delta contract (head-major cache, rows-only K/V outputs).
+LEGACY_KV_CACHE = False
+
 def download_weights():
     print(f"\n--- Downloading Weights from {REPO_ID} ---")
     WEIGHTS_DIR.mkdir(exist_ok=True)
@@ -87,6 +90,8 @@ def run_export_scripts():
         "--output_dir", output_dir_str,
         "--weights_path", weights_path
     ]
+    if LEGACY_KV_CACHE:
+        cmd2.append("--no_kv_delta")
     try:
         subprocess.run(cmd2, check=True, env=env)
         print("✅ FlowLM Export Success")
@@ -137,7 +142,9 @@ import argparse
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Export Script for PocketTTS")
     parser.add_argument("--quantize", action="store_true", help="Run INT8 quantization after export")
+    parser.add_argument("--legacy_kv_cache", action="store_true", help="Export flow_lm_main with the legacy full-cache KV contract (default: KV-delta, see OPTIMIZATION.md)")
     args = parser.parse_args()
+    LEGACY_KV_CACHE = args.legacy_kv_cache
 
     install_check()
     download_weights()

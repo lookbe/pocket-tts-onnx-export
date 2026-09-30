@@ -18,6 +18,10 @@ CONFIG_DIR = Path("pocket_tts") / "config"
 LOW_MEM_DIR = Path("models_low_mem")
 LOW_MEM_SEQ_LEN = 400
 
+# flow_lm_main exports use the KV-delta contract by default (head-major cache in, rows-only K/V out; see
+# OPTIMIZATION.md). --legacy_kv_cache restores the old full-cache [1, cap, H, D] contract for hosts that predate it.
+LEGACY_KV_CACHE = False
+
 def parse_hf_url(url):
     """Parses hf://repo_id/filename@revision into (repo_id, filename, revision)"""
     if not url.startswith("hf://"):
@@ -233,6 +237,8 @@ def export_language(lang_dir: Path):
             "--weights_path", str(weights_path),
             "--config", str(config_path)
         ]
+        if LEGACY_KV_CACHE:
+            flow_cmd.append("--no_kv_delta")
         
         if not run_cmd(flow_cmd, env):
             print(f"FAILED: FlowLM Export Failed for {lang_name}")
@@ -319,6 +325,8 @@ def export_language_low_mem(lang_dir: Path, weights_path: Path, config_path: Pat
             "--config", str(config_path),
             "--seq_len", str(LOW_MEM_SEQ_LEN),
         ]
+        if LEGACY_KV_CACHE:
+            flow_cmd.append("--no_kv_delta")
         if not run_cmd(flow_cmd, env):
             print(f"FAILED: FlowLM Export Failed for {lang_name} (low-mem)")
             return False
@@ -363,7 +371,10 @@ def main():
     parser = argparse.ArgumentParser(description="Multilingual Export and Quantization Script")
     parser.add_argument("--lang", type=str, help="Specific language config name to process (optional)")
     parser.add_argument("--skip_low_mem", action="store_true", help="Skip the low-mem (int4 + separated data + reduced state) variant")
+    parser.add_argument("--legacy_kv_cache", action="store_true", help="Export flow_lm_main with the legacy full-cache KV contract instead of the default KV-delta contract")
     args = parser.parse_args()
+    global LEGACY_KV_CACHE
+    LEGACY_KV_CACHE = args.legacy_kv_cache
 
     if not MODELS_DIR.exists():
         print(f"Creating models directory at {MODELS_DIR.absolute()}")

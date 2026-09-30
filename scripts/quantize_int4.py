@@ -35,10 +35,11 @@ from onnx_export.export_utils import convert_gemm_to_matmul_add, cast_weights_to
 MODELS = ["text_conditioner", "flow_lm_flow", "flow_lm_main", "mimi_decoder", "mimi_encoder"]
 
 
-def quantize_int4(model, op_types_to_quantize, nodes_to_include=None, block_size=128):
+def quantize_int4(model, op_types_to_quantize, nodes_to_include=None, block_size=128, nodes_to_exclude=None):
     quantizer = MatMulNBitsQuantizer(
         model=model,
         nodes_to_include=nodes_to_include,
+        nodes_to_exclude=nodes_to_exclude,
         algo_config=DefaultWeightOnlyQuantConfig(
             block_size=block_size,
             is_symmetric=True,
@@ -94,9 +95,14 @@ def main():
         elif model_name == "flow_lm_main":
             quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
         elif model_name in ("mimi_decoder", "mimi_encoder"):
-            quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
-            n_cast = cast_weights_to_float16(quantized, op_types=("Conv", "ConvTranspose"))
-            print(f"  Cast {n_cast} Conv/ConvTranspose weight/bias tensors to fp16 (compute stays fp32).")
+            # The upsampling ConvTranspose layers are exported as MatMul + overlap-add (OPTIMIZATION.md); their MatMuls
+            # (/decoder/model.N/MatMul) are convolution weights, not linears: keep them out of INT4, and store them
+            # fp16-on-disk like the other conv weights (the still-fp32 MatMuls left after quantization).
+            conv_matmuls = [n.name for n in model.graph.node
+                            if n.op_type == "MatMul" and n.name.startswith("/decoder/model.")]
+            quantized = quantize_int4(model, op_types_to_quantize=("MatMul",), nodes_to_exclude=conv_matmuls)
+            n_cast = cast_weights_to_float16(quantized, op_types=("Conv", "ConvTranspose") + (("MatMul",) if conv_matmuls else ()))
+            print(f"  Excluded {len(conv_matmuls)} ConvTranspose MatMuls from INT4; cast {n_cast} Conv/ConvTranspose/MatMul weight/bias tensors to fp16 (compute stays fp32).")
         else:
             continue
 

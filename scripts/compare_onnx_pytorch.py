@@ -103,7 +103,11 @@ def compare_conditioner(ort_session, pt_wrapper):
 
 def compare_flow_lm_main(ort_session, pt_wrapper, tts_model):
     print("\n--- Comparing Flow LM Main ---")
-    flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=1000)
+    # This script's own (legacy, full-cache [1,cap,H,D]) patches drive the PyTorch side; the ONNX model may use the
+    # KV-delta contract (head-major cache in, rows-only K/V out) -- adapt both directions below.
+    in_shapes = {i.name: list(i.shape) for i in ort_session.get_inputs()}
+    cap = max(in_shapes['state_0'])
+    flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=cap)
     flat_flow_state = flatten_state(flow_state)
     
     test_seq = torch.randn(1, 1, 32)
@@ -129,6 +133,8 @@ def compare_flow_lm_main(ort_session, pt_wrapper, tts_model):
     for i, st in enumerate(flat_flow_state):
         name = f"state_{i}"
         val = st.numpy()
+        if val.ndim == 4 and in_shapes.get(name, [0] * 4)[1] != val.shape[1]:
+            val = val.transpose(0, 2, 1, 3)  # KV-delta model: head-major cache input
         if name in input_types:
             val = cast_to_ort_type(val, input_types[name])
         ort_inputs[name] = val
@@ -143,6 +149,9 @@ def compare_flow_lm_main(ort_session, pt_wrapper, tts_model):
     
     all_states_pass = True
     for i, (p_s, o_s) in enumerate(zip(pt_states, onnx_states)):
+        if p_s.ndim == 4 and o_s.ndim == 4 and p_s.shape != o_s.shape:
+            # KV-delta model returns only the new rows [1,H,L,D]; the fresh PyTorch cache holds them at slots [0, L)
+            p_s = p_s[:, :o_s.shape[2]].transpose(0, 2, 1, 3)
         if not assert_allclose_with_logging(f"FlowLM State {i}", p_s, o_s):
             all_states_pass = False
     
@@ -385,7 +394,11 @@ def main():
         spec.loader.exec_module(export_flow_lm)
         
         ort_flow = ort.InferenceSession(flow_lm_path)
-        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=1000)
+        KV_CAP = max(next(i for i in ort_flow.get_inputs() if i.name == "state_0").shape)
+        # The model's own contract decides which PyTorch state layout the export module must build.
+        KV_IS_DELTA = next(i for i in ort_flow.get_inputs() if i.name == "state_0").shape[1] != KV_CAP
+        export_flow_lm.KV_DELTA = KV_IS_DELTA
+        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=KV_CAP)
         pt_flow = export_flow_lm.FlowLMMainWrapper(tts_model.flow_lm, get_state_structure(flow_state))
         compare_flow_lm_main(ort_flow, pt_flow, tts_model)
         
@@ -396,6 +409,9 @@ def main():
         
     if os.path.exists(mimi_decoder_path):
         try:
+            # Mimi's attention cache always uses the legacy full-cache [1, cap, H, D] layout (only FlowLM has the KV-delta
+            # contract), so build its PyTorch states with the delta layout switched off.
+            export_flow_lm.KV_DELTA = False
             ort_mimi = ort.InferenceSession(mimi_decoder_path)
             mimi_state = init_states(tts_model.mimi, batch_size=1, sequence_length=MIMI_ATTN_CACHE_CAPACITY)
             pt_mimi = MimiWrapper(tts_model.mimi, get_state_structure(mimi_state), tts_model.flow_lm.emb_std, tts_model.flow_lm.emb_mean)
@@ -414,8 +430,10 @@ def main():
         voice_prompt = torch.randn(1, 10, tts_model.flow_lm.dim)
         
         # Test conditioning with voice prompt
-        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=1000)
+        export_flow_lm.KV_DELTA = KV_IS_DELTA
         ort_flow = ort.InferenceSession(flow_lm_path)
+        KV_CAP = max(next(i for i in ort_flow.get_inputs() if i.name == "state_0").shape)
+        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=KV_CAP)
         pt_flow = export_flow_lm.FlowLMMainWrapper(tts_model.flow_lm, get_state_structure(flow_state))
         
         test_seq = torch.randn(1, 1, 32)

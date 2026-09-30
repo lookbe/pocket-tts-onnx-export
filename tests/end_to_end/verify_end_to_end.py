@@ -14,6 +14,7 @@ sys.path.append(str(Path(__file__).parent.parent.parent)) # Root for onnx_export
 from pocket_tts.models.tts_model import TTSModel
 from pocket_tts.modules.stateful_module import init_states
 from onnx_export.export_utils import get_state_structure, flatten_state
+from onnx_export import kv_delta as kvd
 
 # ==============================================================================
 # MONKEYPATCHES for EXACT ONNX PARITY
@@ -153,6 +154,7 @@ def assert_allclose_with_logging(name, expected, actual, rtol=1e-3, atol=1e-3):
 
 def cast_to_ort_type(tensor, ort_type_name):
     if ort_type_name == "FLOAT": return tensor.astype(np.float32)
+    if ort_type_name == "FLOAT16": return tensor.astype(np.float16)
     if ort_type_name == "INT64": return tensor.astype(np.int64)
     return tensor
 
@@ -160,7 +162,8 @@ def get_session_input_types(session):
     res = {}
     for i in session.get_inputs():
         t = i.type
-        if "float" in t: res[i.name] = "FLOAT"
+        if "float16" in t: res[i.name] = "FLOAT16"
+        elif "float" in t: res[i.name] = "FLOAT"
         elif "int64" in t: res[i.name] = "INT64"
         else: res[i.name] = "UNKNOWN"
     return res
@@ -202,6 +205,8 @@ def main():
     ort_conditioner = ort.InferenceSession(os.path.join(args.onnx_dir, "text_conditioner.onnx"))
     ort_main = ort.InferenceSession(os.path.join(args.onnx_dir, "flow_lm_main.onnx"))
     ort_flow = ort.InferenceSession(os.path.join(args.onnx_dir, "flow_lm_flow.onnx"))
+    # KV-cache capacity baked into the exported model (largest dim of its state_0 input)
+    KV_CAP = max(next(i for i in ort_main.get_inputs() if i.name == 'state_0').shape)
 
     # Load export wrapper for PT reference
     export_script_path = Path(__file__).parent.parent.parent / "scripts" / "export_flow_lm.py"
@@ -226,7 +231,7 @@ def main():
         pt_voice_prompt = pt_voice_latents
         
         # State init (1000 frames)
-        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=1000)
+        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=KV_CAP)
         pt_main_wrapper = export_flow_lm.FlowLMMainWrapper(tts_model.flow_lm, get_state_structure(flow_state))
         empty_seq = torch.zeros((1, 0, tts_model.flow_lm.ldim))
         
@@ -238,7 +243,7 @@ def main():
         idx = 2
         for module_name, module_state in flow_state.items():
              for k in sorted(module_state.keys()):
-                 module_state[k] = pt_outputs[idx]
+                 module_state[k] = kvd.merge(module_state[k], pt_outputs[idx], int(module_state["step"].reshape(-1)[0]) if "step" in module_state else 0)
                  idx += 1
 
     # Auto-BOS Injection is now handled internally by the ONNX model
@@ -247,7 +252,7 @@ def main():
 
     input_types = get_session_input_types(ort_main)
     ort_inputs = {"sequence": empty_seq.numpy(), "text_embeddings": onnx_voice_prompt}
-    for i, st in enumerate(flatten_state(init_states(tts_model.flow_lm, 1, 1000))):
+    for i, st in enumerate(flatten_state(init_states(tts_model.flow_lm, 1, KV_CAP))):
         ort_inputs[f"state_{i}"] = cast_to_ort_type(st.numpy(), input_types.get(f"state_{i}", "FLOAT"))
     
     onnx_outputs = ort_main.run(None, ort_inputs)
@@ -258,7 +263,7 @@ def main():
         assert_allclose_with_logging(f"State {i} after Voice", pt_outputs[i+2].numpy(), onnx_outputs[i+2], rtol=1e-5, atol=1e-5)
 
     # Update ONNX state
-    onnx_state = {f"state_{i}": onnx_outputs[i+2] for i in range(len(onnx_outputs) - 2)}
+    onnx_state = kvd.merge_onnx_state(ort_inputs, onnx_outputs)
 
     print("\n--- PHASE 2: Text Conditioning ---")
     tokens = tts_model.flow_lm.conditioner.tokenizer(args.text)
@@ -273,7 +278,7 @@ def main():
         idx = 2
         for module_name, module_state in flow_state.items():
              for k in sorted(module_state.keys()):
-                 module_state[k] = pt_outputs_text[idx]
+                 module_state[k] = kvd.merge(module_state[k], pt_outputs_text[idx], int(module_state["step"].reshape(-1)[0]) if "step" in module_state else 0)
                  idx += 1
 
     onnx_text_emb = ort_conditioner.run(None, {"token_ids": token_ids.numpy().astype(np.int64)})[0]
@@ -289,7 +294,7 @@ def main():
         assert_allclose_with_logging(f"State {i} after Text", pt_outputs_text[i+2].numpy(), onnx_outputs_text[i+2], rtol=1e-5, atol=1e-5)
 
     # Update ONNX state
-    onnx_state = {f"state_{i}": onnx_outputs_text[i+2] for i in range(len(onnx_outputs_text) - 2)}
+    onnx_state = kvd.merge_onnx_state(ort_inputs_text, onnx_outputs_text)
 
 
     print("\n--- PHASE 3: AR Generation (5 steps) ---")
@@ -332,7 +337,7 @@ def main():
             idx = 2
             for module_name, module_state in flow_state.items():
                  for k in sorted(module_state.keys()):
-                     module_state[k] = pt_ar_outputs[idx]
+                     module_state[k] = kvd.merge(module_state[k], pt_ar_outputs[idx], int(module_state["step"].reshape(-1)[0]) if "step" in module_state else 0)
                      idx += 1
 
         # ONNX AR
@@ -359,7 +364,7 @@ def main():
         assert_allclose_with_logging(f"Step {step_idx+1} Generated Latent", pt_next_latent.numpy(), onnx_next_latent)
         
         # Update ONNX state
-        onnx_state = {f"state_{i}": onnx_ar_outputs[i+2] for i in range(len(onnx_ar_outputs) - 2)}
+        onnx_state = kvd.merge_onnx_state(ort_inputs_ar, onnx_ar_outputs)
         
         # Next loop inputs
         pt_current_latent = pt_next_latent

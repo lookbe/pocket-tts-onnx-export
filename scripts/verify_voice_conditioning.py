@@ -28,6 +28,8 @@ def assert_allclose_with_logging(name, expected, actual, rtol=1e-3, atol=1e-3):
 def cast_to_ort_type(tensor, ort_type_name):
     if ort_type_name == "FLOAT":
         return tensor.astype(np.float32)
+    if ort_type_name == "FLOAT16":
+        return tensor.astype(np.float16)
     if ort_type_name == "INT64":
         return tensor.astype(np.int64)
     return tensor
@@ -36,7 +38,8 @@ def get_session_input_types(session):
     res = {}
     for i in session.get_inputs():
         t = i.type
-        if "float" in t: res[i.name] = "FLOAT"
+        if "float16" in t: res[i.name] = "FLOAT16"
+        elif "float" in t: res[i.name] = "FLOAT"
         elif "int64" in t: res[i.name] = "INT64"
         else: res[i.name] = "UNKNOWN"
     return res
@@ -212,8 +215,20 @@ def main():
         print(f"\nComparing Flow LM Main conditioning with prompt (len={pt_prompt.shape[1]})...")
         ort_flow = ort.InferenceSession(flow_lm_path)
         
-        # Initialize states - MUST MATCH ONNX FIXED SHAPE (1000)
-        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=1000)
+        # Load the export module first: its patches define the (KV-delta) state layout used below
+        import sys
+        import importlib.util
+        from pathlib import Path
+        script_dir = Path(__file__).parent
+        export_script_path = script_dir / "export_flow_lm.py"
+        spec = importlib.util.spec_from_file_location("export_flow_lm", str(export_script_path))
+        export_flow_lm = importlib.util.module_from_spec(spec)
+        sys.modules["export_flow_lm"] = export_flow_lm
+        spec.loader.exec_module(export_flow_lm)
+        
+        # Initialize states - MUST MATCH ONNX FIXED SHAPE (capacity read from the model)
+        cap = max(ort_flow.get_inputs()[[i.name for i in ort_flow.get_inputs()].index('state_0')].shape)
+        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=cap)
         flat_flow_state = flatten_state(flow_state)
         
         # Conditioning input: empty sequence (seq_len=0)
@@ -221,16 +236,6 @@ def main():
         
         # PyTorch flow LM run (prompting)
         with torch.no_grad():
-            import sys
-            import importlib.util
-            from pathlib import Path
-            script_dir = Path(__file__).parent
-            export_script_path = script_dir / "export_flow_lm.py"
-            spec = importlib.util.spec_from_file_location("export_flow_lm", str(export_script_path))
-            export_flow_lm = importlib.util.module_from_spec(spec)
-            sys.modules["export_flow_lm"] = export_flow_lm
-            spec.loader.exec_module(export_flow_lm)
-            
             pt_wrapper = export_flow_lm.FlowLMMainWrapper(tts_model.flow_lm, get_state_structure(flow_state))
             pt_outputs = pt_wrapper(test_seq, pt_prompt, flat_flow_state)
             

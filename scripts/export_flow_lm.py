@@ -41,6 +41,11 @@ from onnx_export.export_utils import get_state_structure, flatten_state
 # 0. CONFIGURATION
 # ==============================================================================
 USE_FLOAT16_STATES = True #Optimization: Use float16 for states to reduce memory bandwidth by 50%
+# KV-delta contract (default; --no_kv_delta restores the legacy one). The cache input is head-major
+# [B, H, capacity, D] and each K/V out_state is ONLY this call's new rows [B, H, L, D]; the host writes them into its
+# persistent cache at slots [offset, offset + L). No per-step copy of the whole cache, no K/V transposes. The
+# C++ exporter (cpp_export, --kv-delta / --no-kv-delta) emits the identical contract. See OPTIMIZATION.md.
+KV_DELTA = True
 
 # ==============================================================================
 # 1. MONKEYPATCHES
@@ -53,19 +58,11 @@ from pocket_tts.modules.attention import StreamingMultiheadAttention, _build_att
 def patched_init_state(self, batch_size: int, sequence_length: int) -> dict[str, torch.Tensor]:
     device = self.in_proj.weight.device
     dtype = torch.float16 if USE_FLOAT16_STATES else torch.float32
+    shape = ((batch_size, self.num_heads, sequence_length, self.dim_per_head) if KV_DELTA
+             else (batch_size, sequence_length, self.num_heads, self.dim_per_head))
     return dict(
-        cache_k=torch.full(
-            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
-            0.0,
-            device=device,
-            dtype=dtype,
-        ),
-        cache_v=torch.full(
-            (batch_size, sequence_length, self.num_heads, self.dim_per_head),
-            0.0,
-            device=device,
-            dtype=dtype,
-        ),
+        cache_k=torch.full(shape, 0.0, device=device, dtype=dtype),
+        cache_v=torch.full(shape, 0.0, device=device, dtype=dtype),
         step=torch.zeros(batch_size, dtype=torch.long, device=device),
     )
 
@@ -85,6 +82,21 @@ def patched_append_and_get(self, k, v, state):
     off = step.view(-1)[0]
 
     B, L, H, D = k.shape
+
+    if KV_DELTA:
+        # New rows, head-major [B, H, L, D]. They are what leaves the graph as out_state (the host appends them);
+        # attention reads the filled prefix of the incoming cache followed by them.
+        cdt = torch.float16 if USE_FLOAT16_STATES else torch.float32
+        k_new = k.transpose(1, 2).to(cdt)
+        v_new = v.transpose(1, 2).to(cdt)
+        k_attn = torch.cat([cache_k[:, :, :off], k_new], dim=2).float()
+        v_attn = torch.cat([cache_v[:, :, :off], v_new], dim=2).float()
+        state["cache_k"] = k_new
+        state["cache_v"] = v_new
+        valid_len = off + L
+        MAX_POS = 4096
+        pos_k = torch.arange(MAX_POS, device=k_attn.device, dtype=torch.long)[:valid_len].unsqueeze(0).expand(B, -1)
+        return k_attn, v_attn, pos_k, step
 
     # FlowLM's cache is linear (capacity covers the whole utterance budget and is never
     # wrapped; only Mimi's export needs a ring buffer, see export_mimi_and_conditioner.py).
@@ -247,7 +259,11 @@ def main():
     parser.add_argument("--weights_path", "-w", type=str, default="weights/tts_b6369a24.safetensors", help="Path to weights file used to load FlowLM")
     parser.add_argument("--config", "-c", type=str, default=None, help="Path to config YAML file")
     parser.add_argument("--seq_len", type=int, default=1000, help="Static KV-cache sequence length baked into the exported graph")
+    parser.add_argument("--no_kv_delta", action="store_true",
+                        help="Legacy contract: full [1, cap, H, D] KV cache in and out (default is the rows-only head-major KV-delta contract)")
     args = parser.parse_args()
+    global KV_DELTA
+    KV_DELTA = not args.no_kv_delta
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -299,16 +315,21 @@ def main():
     main_args = (dummy_seq, dummy_text, flat_state)
     
     main_out_path = os.path.join(args.output_dir, "flow_lm_main.onnx")
+    main_dynamic_axes = {"sequence": {1: "seq_len"}, "text_embeddings": {1: "text_len"}}
+    if KV_DELTA:
+        for i, t in enumerate(flat_state):
+            if t.ndim == 4:  # K/V cache -> rows-only output with a dynamic row count
+                main_dynamic_axes[f"out_state_{i}"] = {2: "new_len"}
     torch.onnx.export(
         main_wrapper, main_args, main_out_path,
         input_names=["sequence", "text_embeddings"] + state_input_names,
         output_names=["conditioning", "eos_logit"] + state_output_names,
-        dynamic_axes={"sequence": {1: "seq_len"}, "text_embeddings": {1: "text_len"}},
+        dynamic_axes=main_dynamic_axes,
         opset_version=17, do_constant_folding=True,
         dynamo=False
     )
 
-    print(f"Exported {main_out_path}")
+    print(f"Exported {main_out_path} (KV contract: {'delta/head-major' if KV_DELTA else 'legacy full cache'})")
 
     # 1.1 Export BOS embedding logic REMOVED (now embedded in flow_lm_main.onnx)
     

@@ -61,6 +61,16 @@ def quantize_file(input_path: Path, output_path: Path, model_name: str, separate
                             nodes_to_quantize.append(name)
         print(f"  Selected {len(nodes_to_quantize)} nodes for quantization.")
     
+    nodes_to_exclude = []
+    if model_name == "mimi_decoder":
+        # The SEANet upsampling ConvTranspose layers are exported as MatMul + overlap-add (see OPTIMIZATION.md): their
+        # MatMul nodes live under /decoder/model.N/, NOT in the decoder transformer. They are convolution weights and
+        # must stay fp32 (quantizing them is what the C++ exporter's presets also never do).
+        model = onnx.load(str(input_path))
+        nodes_to_exclude = [n.name for n in model.graph.node
+                            if n.op_type == "MatMul" and n.name.startswith("/decoder/model.")]
+        print(f"  Excluding {len(nodes_to_exclude)} upsampling ConvTranspose MatMul nodes from quantization.")
+
     temp_path = None
     try:
         print("  Running shape inference...")
@@ -84,6 +94,8 @@ def quantize_file(input_path: Path, output_path: Path, model_name: str, separate
 
         if nodes_to_quantize:
             quant_args["nodes_to_quantize"] = nodes_to_quantize
+        if nodes_to_exclude:
+            quant_args["nodes_to_exclude"] = nodes_to_exclude
 
         quantize_dynamic(**quant_args)
 

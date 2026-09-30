@@ -9,6 +9,7 @@ from scipy.signal import resample_poly
 from pocket_tts.models.tts_model import TTSModel
 from pocket_tts.modules.stateful_module import init_states
 from onnx_export.export_utils import get_state_structure, flatten_state
+from onnx_export import kv_delta as kvd
 
 # ==============================================================================
 # MONKEYPATCHES for EXACT ONNX PARITY
@@ -129,6 +130,8 @@ def assert_allclose_with_logging(name, expected, actual, rtol=1e-3, atol=1e-3):
 def cast_to_ort_type(tensor, ort_type_name):
     if ort_type_name == "FLOAT":
         return tensor.astype(np.float32)
+    if ort_type_name == "FLOAT16":
+        return tensor.astype(np.float16)
     if ort_type_name == "INT64":
         return tensor.astype(np.int64)
     return tensor
@@ -137,7 +140,8 @@ def get_session_input_types(session):
     res = {}
     for i in session.get_inputs():
         t = i.type
-        if "float" in t: res[i.name] = "FLOAT"
+        if "float16" in t: res[i.name] = "FLOAT16"
+        elif "float" in t: res[i.name] = "FLOAT"
         elif "int64" in t: res[i.name] = "INT64"
         else: res[i.name] = "UNKNOWN"
     return res
@@ -164,6 +168,8 @@ def main():
     ort_encoder = ort.InferenceSession(encoder_path)
     ort_conditioner = ort.InferenceSession(conditioner_path)
     ort_flow = ort.InferenceSession(flow_lm_path)
+    # KV-cache capacity baked into the exported model (largest dim of its state_0 input)
+    KV_CAP = max(next(i for i in ort_flow.get_inputs() if i.name == 'state_0').shape)
 
     # Load and resample audio
     audio, sr = sf.read(args.audio)
@@ -183,10 +189,7 @@ def main():
         # PT logic for voice conditioning (BOS prepended)
         pt_voice_prompt = torch.cat([tts_model.flow_lm.bos_before_voice, pt_voice_latents], dim=1)
         
-        # Init state
-        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=1000)
-        
-        # Run PT Voice Conditioning
+        # Load the export module first: its patches define the (KV-delta) state layout
         import sys
         import importlib.util
         from pathlib import Path
@@ -196,6 +199,9 @@ def main():
         export_flow_lm = importlib.util.module_from_spec(spec)
         sys.modules["export_flow_lm"] = export_flow_lm
         spec.loader.exec_module(export_flow_lm)
+        
+        # Init state
+        flow_state = init_states(tts_model.flow_lm, batch_size=1, sequence_length=KV_CAP)
         
         pt_main_wrapper = export_flow_lm.FlowLMMainWrapper(tts_model.flow_lm, get_state_structure(flow_state))
         empty_seq = torch.zeros((1, 0, tts_model.flow_lm.ldim))
@@ -212,7 +218,7 @@ def main():
         idx = 2
         for module_name, module_state in flow_state.items():
              for k in sorted(module_state.keys()):
-                 module_state[k] = pt_outputs[idx]
+                 module_state[k] = kvd.merge(module_state[k], pt_outputs[idx], int(module_state["step"].reshape(-1)[0]) if "step" in module_state else 0)
                  idx += 1
 
     # ONNX Voice Conditioning Parity check
@@ -231,16 +237,14 @@ def main():
         "sequence": empty_seq.numpy(),
         "text_embeddings": onnx_voice_promo_input,
     }
-    for i, st in enumerate(flatten_state(init_states(tts_model.flow_lm, 1, 1000))):
+    for i, st in enumerate(flatten_state(init_states(tts_model.flow_lm, 1, KV_CAP))):
         ort_inputs[f"state_{i}"] = cast_to_ort_type(st.numpy(), input_types.get(f"state_{i}", "FLOAT"))
     
     onnx_outputs = ort_flow.run(None, ort_inputs)
     assert_allclose_with_logging("Voice Conditioning (c)", pt_voice_c.numpy(), onnx_outputs[0])
     
     # Update ONNX state for phase 2
-    onnx_state = {}
-    for i in range(len(onnx_outputs) - 2):
-        onnx_state[f"state_{i}"] = onnx_outputs[i+2]
+    onnx_state = kvd.merge_onnx_state(ort_inputs, onnx_outputs)
 
     # --------------------------------------------------------------------------
     # STEP 2: TEXT CONDITIONING

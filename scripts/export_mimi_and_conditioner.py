@@ -256,10 +256,56 @@ def patched_conv1d_forward(self, x, model_state: dict | None):
             state["first"] = torch.zeros_like(state["first"])
     return y
 
+# ---- Faster-on-CPU equivalents of ELU and ConvTranspose1d (see OPTIMIZATION.md; same rewrites as cpp_export) ----
+import torch.nn.functional as _F
+
+def _fast_elu_forward(self, x):
+    # ELU(x) = relu(x) + alpha * (exp(min(x, 0)) - 1): ORT's CPU Elu kernel is ~2.5x slower than Relu/Min/Exp.
+    em1 = torch.exp(torch.minimum(x, x.new_zeros(()))) - 1.0
+    if self.alpha != 1.0:
+        em1 = em1 * self.alpha
+    return torch.relu(x) + em1
+
+torch.nn.ELU.forward = _fast_elu_forward
+
+def _fast_convtr(m, x):
+    """nn.ConvTranspose1d(kernel == 2*stride, no padding) as MatMul + overlap-add (groups == 1) or as an
+    elementwise overlap-add (depthwise). Falls back to the native op for anything else."""
+    s = m.stride[0]
+    k = m.kernel_size[0]
+    g = m.groups
+    plain = m.padding[0] == 0 and m.dilation[0] == 1 and m.output_padding[0] == 0 and k == 2 * s
+    if not plain:
+        return m(x)
+    B = x.shape[0]
+    W = m.weight  # [cin, cout/g, k]
+    cin, cpg = W.shape[0], W.shape[1]
+    if g == 1:
+        cout = cpg
+        wm = W.permute(0, 2, 1).reshape(cin, k * cout)            # column index = tap * cout + co
+        ym = torch.matmul(x.transpose(1, 2), wm)                  # [B, T, k*cout]
+        y4 = ym.reshape(B, -1, 2, s, cout)                        # [B, T, 2, s, cout]
+        a, b2 = y4[:, :, 0], y4[:, :, 1]                          # [B, T, s, cout]
+        o = _F.pad(a, (0, 0, 0, 0, 0, 1)) + _F.pad(b2, (0, 0, 0, 0, 1, 0))   # [B, T+1, s, cout]
+        o = o.reshape(B, -1, cout)
+        if m.bias is not None:
+            o = o + m.bias
+        return o.transpose(1, 2)                                  # [B, cout, (T+1)*s]
+    if g == cin and cpg == 1:
+        wa = W[:, 0, :s].reshape(1, cin, 1, s)
+        wb = W[:, 0, s:].reshape(1, cin, 1, s)
+        x4 = x.unsqueeze(-1)                                      # [B, C, T, 1]
+        o = _F.pad(x4 * wa, (0, 0, 0, 1)) + _F.pad(x4 * wb, (0, 0, 1, 0))   # [B, C, T+1, s]
+        o = o.reshape(B, cin, -1)
+        if m.bias is not None:
+            o = o + m.bias[:, None]
+        return o
+    return m(x)
+
 def patched_convtr_forward(self, x, mimi_state: dict):
     state_dict = self.get_state(mimi_state)
     layer_state = state_dict["partial"]
-    y = self.convtr(x)
+    y = _fast_convtr(self.convtr, x)
     PT = layer_state.shape[-1]
     if PT > 0:
         # Avoid inplace on y if possible, but y is local. 
