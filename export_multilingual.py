@@ -356,14 +356,15 @@ def export_language_low_mem(lang_dir: Path, weights_path: Path, config_path: Pat
         print(f"FAILED: Quantization Failed for {lang_name} (low-mem)")
         return False
 
-    # 4. Quantize to INT4 with external (separated) weight data
-    print(f"\n[4/4] Quantizing ONNX models to INT4 (separated data) for {lang_name} (low-mem)...")
+    # 4. INT4 (b64, accuracy_level 4, separated data) for flow_lm_main + mimi_decoder only; text_conditioner/flow_lm_flow stay INT8 from step 3, mimi_encoder stays fp32
+    print(f"\n[4/4] Quantizing flow_lm_main + mimi_decoder to INT4 (separated data) for {lang_name} (low-mem)...")
     quant_int4_cmd = [
         sys.executable,
         str(SCRIPTS_DIR / "quantize_int4.py"),
         "--input_dir", str(low_mem_lang_dir),
         "--output_dir", str(low_mem_lang_dir),
         "--separate_data",
+        "--low_mem",
     ]
     if not run_cmd(quant_int4_cmd, env):
         print(f"FAILED: INT4 Quantization Failed for {lang_name} (low-mem)")

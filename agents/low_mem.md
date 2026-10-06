@@ -9,11 +9,11 @@
 
 The low-mem variant is exactly **three changes combined**, and they only pay off together:
 
-## 1. INT4 (`MatMulNBitsQuantizer`)
-Shrinks weight bytes the most out of any lever here (vs. fp32 or int8). Applied via `scripts/quantize_int4.py`
-to `text_conditioner`, `flow_lm_flow`, `flow_lm_main`, `mimi_decoder`. **`mimi_encoder` is deliberately skipped
-and stays fp32** — it's only used for voice cloning (infrequent, not on the hot generation path), and it isn't
-worth the extra quality risk for a model that small.
+## 1. INT4 (`MatMulNBitsQuantizer`) + INT8
+Applied via `scripts/quantize_int4.py --low_mem` to **`flow_lm_main` and `mimi_decoder` only**, with block size 64
+and `accuracy_level=4` (int8 compute inside `MatMulNBits`, no fp32 dequant — much faster than the default level 0).
+`text_conditioner` and `flow_lm_flow` use the INT8 models from `quantize.py` (also separated); `mimi_encoder` stays fp32.
+The C++ `--preset low_mem` (`st2onnx`) emits the same set. The non-low-mem `models/<lang>/` path is unchanged.
 
 ## 2. Separated (external) weight data
 Without this, int4 gains are partly cancelled out at *load* time. onnxruntime's `session.use_mmap=1` only maps

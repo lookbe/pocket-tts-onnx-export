@@ -35,7 +35,18 @@ from onnx_export.export_utils import convert_gemm_to_matmul_add, cast_weights_to
 MODELS = ["text_conditioner", "flow_lm_flow", "flow_lm_main", "mimi_decoder", "mimi_encoder"]
 
 
-def quantize_int4(model, op_types_to_quantize, nodes_to_include=None, block_size=128, nodes_to_exclude=None):
+# --low_mem: only these are INT4 (block 64, accuracy_level 4 = int8 compute in MatMulNBits); the rest of the
+# low-mem set (text_conditioner, flow_lm_flow) is INT8 from quantize.py; mimi_encoder stays fp32.
+LOW_MEM_MODELS = ["flow_lm_main", "mimi_decoder"]
+LOW_MEM_BLOCK_SIZE = 64
+LOW_MEM_ACCURACY_LEVEL = 4
+
+
+def quantize_int4(model, op_types_to_quantize, nodes_to_include=None, block_size=128, nodes_to_exclude=None,
+                  accuracy_level=None):
+    config_kwargs = {}
+    if accuracy_level is not None:
+        config_kwargs["accuracy_level"] = accuracy_level
     quantizer = MatMulNBitsQuantizer(
         model=model,
         nodes_to_include=nodes_to_include,
@@ -44,6 +55,7 @@ def quantize_int4(model, op_types_to_quantize, nodes_to_include=None, block_size
             block_size=block_size,
             is_symmetric=True,
             op_types_to_quantize=op_types_to_quantize,
+            **config_kwargs,
         ),
     )
     quantizer.process()
@@ -70,13 +82,17 @@ def main():
     parser.add_argument("--input_dir", "-i", type=str, required=True, help="Directory containing FP32 ONNX models")
     parser.add_argument("--output_dir", "-o", type=str, required=True, help="Output directory for quantized ONNX models")
     parser.add_argument("--separate_data", action="store_true", help="Save each quantized model as .onnx + external .onnx.data weights file (instead of a single embedded .onnx)")
+    parser.add_argument("--low_mem", action="store_true", help="Low-memory preset: INT4 (block 64, accuracy_level 4) for flow_lm_main and mimi_decoder only")
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for model_name in MODELS:
+    block_override = LOW_MEM_BLOCK_SIZE if args.low_mem else None
+    accuracy_level = LOW_MEM_ACCURACY_LEVEL if args.low_mem else None
+
+    for model_name in (LOW_MEM_MODELS if args.low_mem else MODELS):
         in_file = input_dir / f"{model_name}.onnx"
         if not in_file.exists():
             print(f"Skipping {model_name} (not found in {input_dir})")
@@ -93,14 +109,16 @@ def main():
             print(f"  Converted {converted} Gemm nodes to MatMul+Add (so they're quantizable).")
             quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
         elif model_name == "flow_lm_main":
-            quantized = quantize_int4(model, op_types_to_quantize=("MatMul",))
+            quantized = quantize_int4(model, op_types_to_quantize=("MatMul",),
+                                      block_size=block_override or 128, accuracy_level=accuracy_level)
         elif model_name in ("mimi_decoder", "mimi_encoder"):
             # The upsampling ConvTranspose layers are exported as MatMul + overlap-add (OPTIMIZATION.md); their MatMuls
             # (/decoder/model.N/MatMul) are convolution weights, not linears: keep them out of INT4, and store them
             # fp16-on-disk like the other conv weights (the still-fp32 MatMuls left after quantization).
             conv_matmuls = [n.name for n in model.graph.node
                             if n.op_type == "MatMul" and n.name.startswith("/decoder/model.")]
-            quantized = quantize_int4(model, op_types_to_quantize=("MatMul",), nodes_to_exclude=conv_matmuls)
+            quantized = quantize_int4(model, op_types_to_quantize=("MatMul",), nodes_to_exclude=conv_matmuls,
+                                      block_size=block_override or 128, accuracy_level=accuracy_level)
             n_cast = cast_weights_to_float16(quantized, op_types=("Conv", "ConvTranspose") + (("MatMul",) if conv_matmuls else ()))
             print(f"  Excluded {len(conv_matmuls)} ConvTranspose MatMuls from INT4; cast {n_cast} Conv/ConvTranspose/MatMul weight/bias tensors to fp16 (compute stays fp32).")
         else:
