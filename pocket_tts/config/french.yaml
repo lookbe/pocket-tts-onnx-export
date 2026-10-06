@@ -18,6 +18,11 @@ replace_characters:
   '[': ''
   ']': ''
 
+# Word-timestamp head(s) for these weights, found by scripts/find_timestamp_heads.py (worst-seed score 1.000). Exporters emit `ts_logits` when this is set.
+timestamp_heads:
+- layer: 3
+  head: 14
+
 flow_lm:
   insert_bos_before_voice: true
   dtype: float32

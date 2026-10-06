@@ -16,9 +16,11 @@ replace_characters:
   '[': ''
   ']': ''
 
-# NOT enabled: pocket-tts-timestamped README lists L3H6 for its german checkpoint, but these weights are another
-# revision (+ tokenizers tokenizer) and probe_timestamp_heads.py gives Spearman 0.21: does not track the text on these weights. Uncomment only after a better head is verified:
-# timestamp_heads: ... (see TIMESTAMPS.md)
+
+# Word-timestamp head(s) for these weights, found by scripts/find_timestamp_heads.py (worst-seed score 1.000). Exporters emit `ts_logits` when this is set.
+timestamp_heads:
+- layer: 3
+  head: 14
 
 flow_lm:
   insert_bos_before_voice: true

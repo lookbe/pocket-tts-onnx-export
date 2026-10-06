@@ -15,9 +15,11 @@ replace_characters:
   '[': ''
   ']': ''
 
-# NOT enabled: pocket-tts-timestamped README lists L4H0 for its italian checkpoint, but these weights are another
-# revision (+ tokenizers tokenizer) and probe_timestamp_heads.py gives Spearman 0.78: marginal on these weights. Uncomment only after a better head is verified:
-# timestamp_heads: ... (see TIMESTAMPS.md)
+
+# Word-timestamp head(s) for these weights, found by scripts/find_timestamp_heads.py (worst-seed score 0.998). Exporters emit `ts_logits` when this is set.
+timestamp_heads:
+- layer: 3
+  head: 10
 
 flow_lm:
   insert_bos_before_voice: true
