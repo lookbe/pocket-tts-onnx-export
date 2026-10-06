@@ -155,7 +155,8 @@ def e2e(lang, cfg_path, cfg, weights, work, head, cli, audio):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # CLI output holds non-ASCII words; cp1252 consoles crash
+    ap =argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--lang", required=True, help="config name in pocket_tts/config (german, spanish, ...)")
     ap.add_argument("--work_dir", default=None, help="default: timestamp_probe/<lang>")
     ap.add_argument("--seeds", default="1234,1,2")

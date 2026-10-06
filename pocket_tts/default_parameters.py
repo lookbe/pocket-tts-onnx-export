@@ -45,6 +45,51 @@ DEFAULT_TEXT_FOR_LANGUAGE = {
         "Soy lo suficientemente rápido para funcionar en pequeñas CPU. "
         "Espero que te guste."
     ),
+    "indonesian": (
+        "Halo dunia. Saya Pocket TTS dari Kyutai. "
+        "Saya cukup cepat untuk berjalan di CPU kecil. "
+        "Saya harap kamu menyukai saya."
+    ),
+    "korean": (
+        "안녕하세요 세계. 저는 키유타의 포켓 TTS입니다. "
+        "작은 CPU에서도 실행할 수 있을 만큼 빠릅니다. "
+        "저를 좋아해 주시면 좋겠어요."
+    ),
+    "czech": (
+        "Ahoj světe. Jsem Pocket TTS od Kyutai. "
+        "Jsem dost rychlý na to, abych běžel i na malých procesorech. "
+        "Doufám, že se vám budu líbit."
+    ),
+    "greek": (
+        "Γεια σου κόσμε. Είμαι το Pocket TTS της Kyutai. "
+        "Είμαι αρκετά γρήγορο ώστε να τρέχω σε μικρούς επεξεργαστές. "
+        "Ελπίζω να σας αρέσω."
+    ),
+    "polish": (
+        "Witaj świecie. Jestem Pocket TTS od Kyutai. "
+        "Jestem na tyle szybki, że działam na małych procesorach. "
+        "Mam nadzieję, że mnie polubisz."
+    ),
+    "russian": (
+        "Привет, мир. Я Pocket TTS от Kyutai. "
+        "Я достаточно быстр, чтобы работать на маленьких процессорах. "
+        "Надеюсь, я вам понравлюсь."
+    ),
+    "hindi": (
+        "नमस्ते दुनिया। मैं Kyutai का Pocket TTS हूँ। "
+        "मैं इतना तेज़ हूँ कि छोटे CPU पर भी चल सकता हूँ। "
+        "मुझे उम्मीद है कि आपको मैं पसंद आऊँगा।"
+    ),
+    "estonian": (
+        "Tere, maailm. Ma olen Kyutai Pocket TTS. "
+        "Ma olen piisavalt kiire, et töötada väikestel protsessoritel. "
+        "Loodan, et sulle meeldin."
+    ),
+    "turkish": (
+        "Merhaba dünya. Ben Kyutai'nin Pocket TTS'iyim. "
+        "Küçük işlemcilerde çalışacak kadar hızlıyım. "
+        "Umarım beni beğenirsiniz."
+    ),
 }
 
 DEFAULT_VOICE_FOR_LANGUAGE = {
