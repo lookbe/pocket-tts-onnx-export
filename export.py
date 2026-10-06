@@ -20,6 +20,7 @@ def install_check():
 
 # Set from --legacy_kv_cache: flow_lm_main defaults to the KV-delta contract (head-major cache, rows-only K/V outputs).
 LEGACY_KV_CACHE = False
+NO_TIMESTAMPS = False
 
 def download_weights():
     print(f"\n--- Downloading Weights from {REPO_ID} ---")
@@ -92,6 +93,8 @@ def run_export_scripts():
     ]
     if LEGACY_KV_CACHE:
         cmd2.append("--no_kv_delta")
+    if NO_TIMESTAMPS:
+        cmd2.append("--no_timestamps")
     try:
         subprocess.run(cmd2, check=True, env=env)
         print("✅ FlowLM Export Success")
@@ -142,9 +145,11 @@ import argparse
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Export Script for PocketTTS")
     parser.add_argument("--quantize", action="store_true", help="Run INT8 quantization after export")
+    parser.add_argument("--no_timestamps", action="store_true", help="Do not add the word-timestamp `ts_logits` output to flow_lm_main (default: added when the language config has timestamp_heads)")
     parser.add_argument("--legacy_kv_cache", action="store_true", help="Export flow_lm_main with the legacy full-cache KV contract (default: KV-delta, see OPTIMIZATION.md)")
     args = parser.parse_args()
     LEGACY_KV_CACHE = args.legacy_kv_cache
+    NO_TIMESTAMPS = args.no_timestamps
 
     install_check()
     download_weights()

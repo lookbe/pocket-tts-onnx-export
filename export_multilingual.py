@@ -21,6 +21,7 @@ LOW_MEM_SEQ_LEN = 400
 # flow_lm_main exports use the KV-delta contract by default (head-major cache in, rows-only K/V out; see
 # OPTIMIZATION.md). --legacy_kv_cache restores the old full-cache [1, cap, H, D] contract for hosts that predate it.
 LEGACY_KV_CACHE = False
+NO_TIMESTAMPS = False
 
 def parse_hf_url(url):
     """Parses hf://repo_id/filename@revision into (repo_id, filename, revision)"""
@@ -239,6 +240,8 @@ def export_language(lang_dir: Path):
         ]
         if LEGACY_KV_CACHE:
             flow_cmd.append("--no_kv_delta")
+        if NO_TIMESTAMPS:
+            flow_cmd.append("--no_timestamps")
         
         if not run_cmd(flow_cmd, env):
             print(f"FAILED: FlowLM Export Failed for {lang_name}")
@@ -327,6 +330,8 @@ def export_language_low_mem(lang_dir: Path, weights_path: Path, config_path: Pat
         ]
         if LEGACY_KV_CACHE:
             flow_cmd.append("--no_kv_delta")
+        if NO_TIMESTAMPS:
+            flow_cmd.append("--no_timestamps")
         if not run_cmd(flow_cmd, env):
             print(f"FAILED: FlowLM Export Failed for {lang_name} (low-mem)")
             return False
@@ -371,10 +376,12 @@ def main():
     parser = argparse.ArgumentParser(description="Multilingual Export and Quantization Script")
     parser.add_argument("--lang", type=str, help="Specific language config name to process (optional)")
     parser.add_argument("--skip_low_mem", action="store_true", help="Skip the low-mem (int4 + separated data + reduced state) variant")
+    parser.add_argument("--no_timestamps", action="store_true", help="Do not add the word-timestamp `ts_logits` output to flow_lm_main (default: added when the language config has timestamp_heads)")
     parser.add_argument("--legacy_kv_cache", action="store_true", help="Export flow_lm_main with the legacy full-cache KV contract instead of the default KV-delta contract")
     args = parser.parse_args()
-    global LEGACY_KV_CACHE
+    global LEGACY_KV_CACHE, NO_TIMESTAMPS
     LEGACY_KV_CACHE = args.legacy_kv_cache
+    NO_TIMESTAMPS = args.no_timestamps
 
     if not MODELS_DIR.exists():
         print(f"Creating models directory at {MODELS_DIR.absolute()}")

@@ -1,3 +1,9 @@
+# Word-timestamp head (README of pocket-tts-timestamped: Portuguese L3H14). Verified on these weights with
+# tests/end_to_end/probe_timestamp_heads.py (attention peak follows the text, Spearman 0.999). Exporters emit `ts_logits` when this is set.
+timestamp_heads:
+- layer: 3
+  head: 14
+
 weights_path: hf://kyutai/pocket-tts/languages/portuguese/model.safetensors@3e82814a68665eec246ff649b14c71331f955c06
 weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/languages/portuguese/model.safetensors@1e08e6a23401048648a9fdcfde2f89348215c2a7
 

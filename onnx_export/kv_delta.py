@@ -30,7 +30,9 @@ def merge_onnx_state(prev, outputs, first_state_output=2):
     (conditioning, eos_logit, out_state_0, ...). Returns the next {"state_i": array} dict. The step counter that
     pairs with K/V state i is state_(3*(i//3)+2) (layout per layer: cache_k, cache_v, step)."""
     nxt = {}
-    for i in range(len(outputs) - first_state_output):
+    # Count states from the inputs: trailing non-state outputs (e.g. the optional `ts_logits`) are not states.
+    n_states = sum(1 for k in prev if k.startswith("state_"))
+    for i in range(n_states):
         name = f"state_{i}"
         out = outputs[i + first_state_output]
         cur = prev[name]

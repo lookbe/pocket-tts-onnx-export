@@ -25,6 +25,7 @@ import typing
 sys.modules['beartype.typing'] = typing
 
 import argparse
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -140,6 +141,17 @@ def patched_sma_forward(self, query: torch.Tensor, model_state: dict | None, att
         MAX_POS = 4096
         pos_q = step.view(-1, 1) + torch.arange(MAX_POS, device=q.device, dtype=torch.long)[:t].unsqueeze(0)
         attn_mask = _build_attention_mask(pos_q, pos_k, self.context)
+    ts_heads = getattr(self, "_ts_heads", None)
+    if ts_heads:
+        # Word-timestamp tap (pocket-tts-timestamped's SelectedAttentionCapture): the scaled q.k logits of the LAST
+        # query row against every filled key, for each selected head -> [n_heads, valid_len] (post-RoPE q, the same
+        # k_attn the real attention reads). The softmax over the text-key slice and the reduction to words happen
+        # host-side, because text_start/text_end are not known to the graph. The row is the last one so the same
+        # tap is valid on AR steps (L == 1); the prompt-pass value is ignored by the host.
+        scale = 1.0 / math.sqrt(q.shape[-1])
+        rows = [torch.matmul(q[:, h, -1:, :], k_attn[:, h].transpose(1, 2)).reshape(1, -1) * scale for h in ts_heads]
+        self._ts_out = torch.cat(rows, dim=0)
+
     x = F.scaled_dot_product_attention(q, k_attn, v_attn, attn_mask, dropout_p=0.0)
     x = x.transpose(1, 2)
     b, t, h, d = x.shape
@@ -173,11 +185,18 @@ class FlowLMMainWrapper(nn.Module):
       - eos_logit: (B, 1) - used for EOS detection
       - out_state_*: Updated states
     """
-    def __init__(self, flow_lm, state_structure, eos_threshold=-4.0):
+    def __init__(self, flow_lm, state_structure, eos_threshold=-4.0, timestamp_heads=()):
         super().__init__()
         self.flow_lm = flow_lm
         self.state_structure = state_structure
         self.eos_threshold = eos_threshold
+        # [(layer, head), ...] in output-row order; empty = no `ts_logits` output.
+        self.timestamp_heads = tuple(timestamp_heads)
+        by_layer = {}
+        for layer, head in self.timestamp_heads:
+            by_layer.setdefault(layer, []).append(head)
+        for layer, heads in by_layer.items():
+            flow_lm.transformer.layers[layer].self_attn._ts_heads = heads
         
     def forward(self, sequence, text_embeddings, state_flat):
         idx = 0
@@ -230,8 +249,17 @@ class FlowLMMainWrapper(nn.Module):
         
         from onnx_export.export_utils import flatten_state as fs
         out_state = fs(model_state)
-        
-        return c.squeeze(0), eos_logit.squeeze(0), *out_state
+
+        ts_out = ()
+        if self.timestamp_heads:
+            # Config order. Appended AFTER the state outputs so out_state_N keeps its position.
+            rows = []
+            for layer, head in self.timestamp_heads:
+                heads = self.flow_lm.transformer.layers[layer].self_attn._ts_heads
+                rows.append(self.flow_lm.transformer.layers[layer].self_attn._ts_out[heads.index(head)][None])
+            ts_out = (torch.cat(rows, dim=0),)
+
+        return c.squeeze(0), eos_logit.squeeze(0), *out_state, *ts_out
 
 
 class FlowNetWrapper(nn.Module):
@@ -252,6 +280,28 @@ class FlowNetWrapper(nn.Module):
 # 3. EXPORT SCRIPT
 # ==============================================================================
 
+def parse_timestamp_heads(spec, config):
+    """'auto' | 'config' | 'off' | 'L:H[,L:H...]' -> [(layer, head), ...] validated against the model's size."""
+    if not spec or spec == "off":
+        return []
+    if spec in ("auto", "config"):
+        heads = [(h.layer, h.head) for h in (config.timestamp_heads or [])]
+        if not heads:
+            if spec == "auto":
+                return []  # no known head for this checkpoint: normal export
+            raise SystemExit("--timestamp_heads config: the config YAML has no timestamp_heads "
+                             "(head choice is checkpoint-specific; pass LAYER:HEAD explicitly)")
+    else:
+        heads = [tuple(int(v) for v in item.split(":")) for item in spec.split(",")]
+    t = config.flow_lm.transformer
+    for layer, head in heads:
+        if not (0 <= layer < t.num_layers and 0 <= head < t.num_heads):
+            raise SystemExit(f"timestamp head {layer}:{head} is outside the model ({t.num_layers} layers x {t.num_heads} heads)")
+    if len(set(heads)) != len(heads):
+        raise SystemExit("duplicate timestamp heads")
+    return heads
+
+
 def main():
     torch.manual_seed(42)
     parser = argparse.ArgumentParser(description="Export FlowLM models to ONNX.")
@@ -261,6 +311,12 @@ def main():
     parser.add_argument("--seq_len", type=int, default=1000, help="Static KV-cache sequence length baked into the exported graph")
     parser.add_argument("--no_kv_delta", action="store_true",
                         help="Legacy contract: full [1, cap, H, D] KV cache in and out (default is the rows-only head-major KV-delta contract)")
+    parser.add_argument("--timestamp_heads", type=str, default="auto",
+                        help="Word-timestamp output: adds `ts_logits` [n_heads, valid_len] (last-query q.k logits of the selected FlowLM "
+                             "heads, the signal of pocket-tts-timestamped) as the LAST output of flow_lm_main. 'auto' (default): use the "
+                             "config YAML's timestamp_heads if it has them, else export normally; 'config': same but fail if absent; "
+                             "'off': never; or 'LAYER:HEAD[,LAYER:HEAD...]' explicitly.")
+    parser.add_argument("--no_timestamps", action="store_true", help="Same as --timestamp_heads off")
     args = parser.parse_args()
     global KV_DELTA
     KV_DELTA = not args.no_kv_delta
@@ -285,6 +341,10 @@ def main():
         except Exception as e:
             print(f"Warning: Failed to reload specified weights: {e}")
 
+    timestamp_heads = parse_timestamp_heads("off" if args.no_timestamps else args.timestamp_heads, tts.config)
+    if timestamp_heads:
+        print(f"Timestamp heads (layer, head): {timestamp_heads}")
+
     # Export BOS-before-voice embedding for web/runtime-side conditioning injection.
     bos_before_voice = getattr(tts.flow_lm, "bos_before_voice", None)
     if bos_before_voice is not None:
@@ -307,7 +367,7 @@ def main():
     # -------------------------------------------------------------
     # 1. Main Flow Model (Backbone)
     print("\nExporting FlowLM Main Model (Backbone)...")
-    main_wrapper = FlowLMMainWrapper(tts.flow_lm, structure)
+    main_wrapper = FlowLMMainWrapper(tts.flow_lm, structure, timestamp_heads=timestamp_heads)
     
     # Needs to handle dynamic axes for both seq and text
     dummy_seq = torch.randn(1, 1, tts.flow_lm.ldim)
@@ -320,10 +380,12 @@ def main():
         for i, t in enumerate(flat_state):
             if t.ndim == 4:  # K/V cache -> rows-only output with a dynamic row count
                 main_dynamic_axes[f"out_state_{i}"] = {2: "new_len"}
+    if timestamp_heads:
+        main_dynamic_axes["ts_logits"] = {1: "valid_len"}
     torch.onnx.export(
         main_wrapper, main_args, main_out_path,
         input_names=["sequence", "text_embeddings"] + state_input_names,
-        output_names=["conditioning", "eos_logit"] + state_output_names,
+        output_names=["conditioning", "eos_logit"] + state_output_names + (["ts_logits"] if timestamp_heads else []),
         dynamic_axes=main_dynamic_axes,
         opset_version=17, do_constant_folding=True,
         dynamo=False

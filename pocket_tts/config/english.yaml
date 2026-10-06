@@ -6,6 +6,10 @@ weights_path: hf://kyutai/pocket-tts/languages/english_2026-09/model.safetensors
 weights_path_without_voice_cloning: hf://kyutai/pocket-tts-without-voice-cloning/languages/english_2026-09/model.safetensors@e7205b6ee50e654a5ea19f0e9df2b0813b05e921
 # Human evals preferred this model at 0.3 (equal WER/similarity/speech rate).
 default_temperature: 0.3
+# Word-timestamp head for these weights (found by pocket-tts-timestamped); used by export_flow_lm.py --timestamp_heads config.
+timestamp_heads:
+- layer: 3
+  head: 8
 
 
 flow_lm:

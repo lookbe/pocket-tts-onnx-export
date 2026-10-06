@@ -114,6 +114,13 @@ class MimiConfig(StrictModel):
     outer_dim: int | None = None
 
 
+class TimestampHeadConfig(StrictModel):
+    """One FlowLM attention head whose text attention tracks the spoken word (see OPTIMIZATION.md)."""
+
+    layer: int
+    head: int
+
+
 class Config(StrictModel):
     flow_lm: FlowLMConfig
     mimi: MimiConfig
@@ -137,6 +144,9 @@ class Config(StrictModel):
     # 0.3 beats 0.7 on WER and UTMOS for every shipped model (human evals agreed for English, #223);
     # a config sets its own value only if it was tuned elsewhere.
     default_temperature: float = 0.3
+    # Heads used by `export_flow_lm.py --timestamp_heads config` to add the `ts_logits` output.
+    # Head choice is specific to a checkpoint: only set it where it was verified for those weights.
+    timestamp_heads: list[TimestampHeadConfig] | None = None
 
 
 def load_config(yaml_path: str | Path) -> Config:
